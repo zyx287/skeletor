@@ -15,7 +15,9 @@
 #    along with this program.
 
 import trimesh as tm
+import numpy as np
 
+__all__ = ['make_trimesh', 'find_closest_node_to_centroid']
 
 def make_trimesh(mesh, validate=True, **kwargs):
     """Construct ``trimesh.Trimesh`` from input data.
@@ -63,3 +65,46 @@ def make_trimesh(mesh, validate=True, **kwargs):
         mesh = fix_mesh(mesh, inplace=True, **kwargs)
 
     return mesh
+
+def find_closest_node_to_centroid(skeleton, mesh):
+    """Find the node in a skeleton that is closest to the centroid of a mesh.
+    
+    This is particularly useful for finding a good root node for skeletonization
+    algorithms that require a starting point, especially when working with neuronal
+    data where the soma/nucleus is a natural starting point.
+    
+    Parameters
+    ----------
+    skeleton : skeletor.Skeleton
+               The skeleton to find a node in.
+    mesh :     trimesh.Trimesh
+               Mesh representing the region of interest (e.g., nucleus or soma).
+               The centroid of this mesh will be used as the reference point.
+    
+    Returns
+    -------
+    int
+        Node ID of the skeleton node closest to the mesh centroid.
+    
+    Examples
+    --------
+    >>> import skeletor as sk
+    >>> import trimesh
+    >>> mesh = sk.example_mesh()
+    >>> skel = sk.skeletonize.by_wavefront(mesh)
+    >>> soma_mesh = trimesh.primitives.Sphere(radius=500, center=[10000, 20000, 15000])
+    >>> root_node = sk.utilities.find_closest_node_to_centroid(skel, soma_mesh)
+    >>> # Use this node as the root for other operations
+    >>> skel = skel.reroot(root_node)
+    """
+    mesh = make_trimesh(mesh, validate=False)
+    centroid = mesh.centroid
+
+    node_coords = skeleton.swc[['x', 'y', 'z']].values
+
+    distances = np.sqrt(np.sum((node_coords - centroid)**2, axis=1))
+
+    closest_node_index = np.argmin(distances)
+    closest_node_id = skeleton.swc.iloc[closest_node_index].node_id
+    
+    return int(closest_node_id)

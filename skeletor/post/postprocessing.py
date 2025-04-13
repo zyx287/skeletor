@@ -13,6 +13,8 @@
 #
 #    You should have received a copy of the GNU General Public License
 #    along with this program.
+import numpy as np
+import pandas as pd
 
 import ncollpyde
 import numbers
@@ -548,6 +550,130 @@ def drop_parallel_twigs(s, theta=0.01, inplace=False):
         # Reindex nodes
         s.reindex(inplace=True)
 
+    return s
+
+def simplify_at_soma(s, mesh, soma_mesh=None, root_id=None, inplace=False):
+    """Simplify skeleton topology around the soma (cell body) region.
+    
+    This function collapses all nodes within the soma into a single node with a
+    large radius, and updates the connectivity of surrounding nodes. This is
+    useful for reducing the complexity of skeletons in the soma region, which
+    often has a complex topology that isn't biologically relevant.
+    
+    Parameters
+    ----------
+    s :         skeletor.Skeleton
+                Skeleton to simplify.
+    mesh :      trimesh.Trimesh
+                Mesh of cells or original mesh used for skeletonization.
+    soma_mesh : trimesh.Trimesh, optional
+                Mesh representing the soma/nucleus region. All skeleton nodes
+                inside this mesh will be collapsed to a single node.
+                If None, will create a default sphere around the mesh centroid.
+    root_id :   int, optional
+                Specify the node ID to use as the parent for the soma node.
+                If None, the function will automatically select the external parent
+                closest to the soma centroid.
+    inplace :   bool
+                If False will make and return a copy of the skeleton. If True,
+                will modify the `s` inplace.
+    
+    Returns
+    -------
+    s :         skeletor.Skeleton
+                Simplified skeleton with all soma nodes collapsed into a single
+                node.
+    """
+    import numpy as np
+    import pandas as pd
+    
+    if not inplace:
+        s = s.copy()
+        
+    if soma_mesh is None:
+        if mesh is None:
+            raise ValueError("Either `mesh` or `soma_mesh` must be provided.")
+        # Create a default soma mesh if none provided, assuming a large sphere around the center of the mesh
+        from trimesh.primitives import Sphere
+        # Use the bounding sphere of the mesh as a default soma mesh
+        center = mesh.centroid if hasattr(mesh, 'centroid') else mesh.bounding_box.centroid
+        radius = max(mesh.bounding_box.extents) * 0.3  # Reduced from 1.2 to be more reasonable for neural soma
+        soma_mesh = Sphere(radius=radius, center=center).to_trimesh()
+    else:
+        from ..utilities import make_trimesh
+        soma_mesh = make_trimesh(soma_mesh, validate=False)
+    
+    import ncollpyde
+    coll = ncollpyde.Volume(soma_mesh.vertices, soma_mesh.faces, validate=False)
+    node_coords = s.swc[['x', 'y', 'z']].values
+    inside_soma = coll.contains(node_coords)
+    
+    if not np.any(inside_soma):
+        print("No nodes found inside the soma mesh. Returning original skeleton.")
+        return s
+        
+    soma_indices = np.where(inside_soma)[0]
+    nodes_in_soma = s.swc.iloc[soma_indices].node_id.values
+    
+    soma_center = soma_mesh.centroid if hasattr(soma_mesh, 'centroid') else soma_mesh.bounding_box.centroid
+    
+    # Calculate radius of soma (Average distance from center to any node in soma plus some margin)
+    dists = np.sqrt(np.sum((s.swc.iloc[soma_indices][['x', 'y', 'z']].values - soma_center)**2, axis=1))
+    soma_radius = np.average(dists) * 1.1  # Also arbitrary choice
+    
+    soma_node_id = s.swc.node_id.max() + 1
+    
+    new_swc = s.swc.copy()
+    
+    # Collapse all nodes in soma into a single node:
+    # 1. Nodes outside soma that have parents in the soma
+    children_mask = new_swc.parent_id.isin(nodes_in_soma) & ~new_swc.node_id.isin(nodes_in_soma)
+    
+    # 2. Nodes in soma that have parents outside the soma
+    external_parents = []
+    for i, node in new_swc[new_swc.node_id.isin(nodes_in_soma)].iterrows():
+        if node.parent_id >= 0 and node.parent_id not in nodes_in_soma:
+            external_parents.append(node.parent_id)
+    
+    # Determine the parent ID for the soma node
+    if root_id is not None:
+        # Use the provided root ID
+        soma_parent_id = root_id
+    else:
+        soma_parent_id = -1  # Default to making it a root node
+        
+        if external_parents:
+            # Find the external parent closest to the soma centroid
+            parent_coords = new_swc[new_swc.node_id.isin(external_parents)][['x', 'y', 'z']].values
+            parent_distances = np.sqrt(np.sum((parent_coords - soma_center)**2, axis=1))
+            closest_parent_idx = np.argmin(parent_distances)
+            soma_parent_id = external_parents[closest_parent_idx]
+    
+    # Update children outside soma to point to the new soma node
+    new_swc.loc[children_mask, 'parent_id'] = soma_node_id
+    
+    # Remove all the original soma nodes
+    new_swc = new_swc[~new_swc.node_id.isin(nodes_in_soma)]
+
+    # Add the new soma node
+    soma_row = pd.DataFrame({
+        'node_id': [soma_node_id],
+        'parent_id': [soma_parent_id],
+        'x': [soma_center[0]],
+        'y': [soma_center[1]],
+        'z': [soma_center[2]],
+        'radius': [soma_radius]
+    })
+    new_swc = pd.concat([new_swc, soma_row], ignore_index=True)
+    s.swc = new_swc
+    
+    # Update mesh_map if it exists
+    if s.mesh_map is not None:
+        s.mesh_map[np.isin(s.mesh_map, nodes_in_soma)] = soma_node_id
+
+    # Reindex to make node IDs continuous
+    s.reindex(inplace=True)
+    
     return s
 
 def smooth(s,
