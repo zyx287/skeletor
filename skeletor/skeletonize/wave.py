@@ -181,16 +181,21 @@ def by_wavefront_keep_loops(mesh,
                             soma_mesh=None,
                             origin_from_soma: bool = False,
                             origin_strategy: str = 'soma_surface_fps',
-                            return_tree_swc: bool = False,
+                            return_swc: bool = False,
                             tree_method: str = 'mst',
-                            tree_params: dict | None = None):
-    """Skeletonize a mesh by wavefront contraction and return a Skeleton.
+                            tree_params: dict | None = None,
+                            attach_tree_edges: bool = True):
+    """Skeletonize a mesh by wavefront contraction with optional SWC export.
 
-    The loop-preserving contracted graph is retained on the returned skeleton
-    via ``loop_*`` attributes (e.g. ``loop_edges`` and ``loop_igraph``), while
-    the SWC representation is generated from a tree extracted according to
-    ``tree_method``. This keeps the output compatible with the standard
-    skeletor pipeline (e.g. ``save_swc``) while still exposing cycle metadata.
+    Always computes the loop-preserving contracted graph first. If
+    ``return_swc=False`` (default), returns a plain dictionary with contracted
+    loop graph nodes/edges and the mesh-to-node map, preserving cycles without
+    any tree extraction or SWC conversion.
+
+    If ``return_swc=True``, extracts a tree from the loop graph using
+    ``tree_method``, builds and returns a standard :class:`~skeletor.Skeleton`
+    (SWC-compatible), and attaches loop metadata as ``loop_*`` attributes so
+    the original cyclic contracted graph remains available.
     """
     agg_map = {'mean': np.mean, 'max': np.max, 'min': np.min,
                'median': np.median,
@@ -227,6 +232,18 @@ def by_wavefront_keep_loops(mesh,
         strict_origins=origin_from_soma and origins is not None,
     )
 
+    loop_edges = np.array(G.get_edgelist(), dtype=int)
+
+    if not return_swc:
+        return {
+            'node_centers': node_centers,
+            'node_radii': node_radii,
+            'edges': loop_edges,
+            'igraph': G,
+            'mesh': mesh,
+            'mesh_map': vertex_to_node_map,
+        }
+
     tree_edges = _wavefront_tree_edges(
         G=G,
         node_centers=node_centers,
@@ -250,12 +267,11 @@ def by_wavefront_keep_loops(mesh,
                         method='wavefront')
     skeleton.loop_node_centers = node_centers
     skeleton.loop_node_radii = node_radii
-    skeleton.loop_edges = np.array(G.get_edgelist(), dtype=int)
+    skeleton.loop_edges = loop_edges
     skeleton.loop_igraph = G
     skeleton.loop_vertex_to_node_map = vertex_to_node_map
-
-    if return_tree_swc:
-        skeleton.tree_swc = swc.copy()
+    if attach_tree_edges:
+        skeleton.loop_tree_edges = np.array(tree_edges, dtype=int)
 
     return skeleton
 
