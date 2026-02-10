@@ -27,8 +27,8 @@ from ..utilities import make_trimesh
 from .base import Skeleton
 from .utils import make_swc, reindex_swc, edges_to_graph
 
-__all__ = ['by_wavefront', 'select_wave_origins_from_soma',
-           'compute_robust_dist_to_soma', 'repair_tree_local_swaps']
+__all__ = ['by_wavefront', 'by_wavefront_keep_loops', 'select_wave_origins_from_soma',
+          'compute_robust_dist_to_soma', 'repair_tree_local_swaps']
 
 # This flag determines whether we use inverse radii or edge lengths for the MST.
 # Radii make more sense if working with tubular structures like neurons but this
@@ -135,54 +135,24 @@ def by_wavefront(mesh,
                                                 seed=int(loop_params.get('seed', 1985)),
                                                 k_candidates=int(loop_params.get('k_candidates', 5000)))
 
-    centers_final, radii_final, G = _cast_waves(mesh, waves=waves,
-                                                origins=origins,
-                                                step_size=step_size,
-                                                rad_agg_func=rad_agg_func,
-                                                progress=progress,
-                                                strict_origins=origin_from_soma and origins is not None)
+    node_centers, node_radii, G, vertex_to_node_map = _wavefront_contracted_graph(
+        mesh=mesh,
+        waves=waves,
+        origins=origins,
+        step_size=step_size,
+        rad_agg_func=rad_agg_func,
+        progress=progress,
+        strict_origins=origin_from_soma and origins is not None,
+    )
 
-    # Collapse vertices into nodes
-    (node_centers,
-     vertex_to_node_map) = np.unique(centers_final,
-                                     return_inverse=True, axis=0)
-
-    # Map radii for individual vertices to the collapsed nodes
-    # Using pandas is the fastest way here
-    node_radii = pd.DataFrame()
-    node_radii['node_id'] = vertex_to_node_map
-    node_radii['radius'] = radii_final
-    node_radii = node_radii.groupby('node_id').radius.apply(rad_agg_func).values
-
-    # Contract vertices
-    G.contract_vertices(vertex_to_node_map)
-
-    # Remove self loops and duplicate edges
-    G = G.simplify()
-
-    # Generate hierarchical tree
-    el = np.array(G.get_edgelist(), dtype=int)
-
-    if len(el) == 0:
-        tree_edges = el
-    elif loop_break == 'mst':
-        if PRESERVE_BACKBONE:
-            weights = _edge_strength_weights(el=el,
-                                             node_radii=node_radii,
-                                             node_centers=node_centers)
-        else:
-            weights = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
-
-        tree = G.spanning_tree(weights=1 / weights)
-        tree_edges = np.array(tree.get_edgelist(), dtype=int)
-    else:
-        soma_mesh = make_trimesh(soma_mesh, validate=False)
-        tree_edges = _soma_aware_tree_edges(G=G,
-                                            node_centers=node_centers,
-                                            node_radii=node_radii,
-                                            soma_mesh=soma_mesh,
-                                            mode=loop_break,
-                                            loop_params=loop_params)
+    tree_edges = _wavefront_tree_edges(
+        G=G,
+        node_centers=node_centers,
+        node_radii=node_radii,
+        loop_break=loop_break,
+        soma_mesh=soma_mesh,
+        loop_params=loop_params,
+    )
 
     # Create a directed acyclic and hierarchical graph
     G_nx = edges_to_graph(edges=np.array(tree_edges, dtype=int),
@@ -200,6 +170,153 @@ def by_wavefront(mesh,
 
     return Skeleton(swc=swc, mesh=mesh, mesh_map=vertex_to_node_map,
                     method='wavefront')
+
+
+def by_wavefront_keep_loops(mesh,
+                            waves=1,
+                            origins=None,
+                            step_size=1,
+                            radius_agg='mean',
+                            progress=True,
+                            soma_mesh=None,
+                            origin_from_soma: bool = False,
+                            origin_strategy: str = 'soma_surface_fps',
+                            return_tree_swc: bool = False,
+                            tree_method: str = 'mst',
+                            tree_params: dict | None = None):
+    """Skeletonize a mesh by wavefront contraction while preserving cycles.
+
+    This follows the same wavefront contraction pipeline as :func:`by_wavefront`
+    but stops before loop-breaking. The returned ``edges`` are the full
+    simplified contracted graph and therefore may contain cycles. This is useful
+    when custom loop breaking is required downstream.
+
+    Notes
+    -----
+    SWC cannot encode loops. If ``return_tree_swc=True``, a tree is extracted
+    only as a convenience export/visualization product while loop-preserving
+    graph outputs are still returned unchanged.
+    """
+    agg_map = {'mean': np.mean, 'max': np.max, 'min': np.min,
+               'median': np.median,
+               'percentile75': lambda x: np.percentile(x, 75),
+               'percentile25': lambda x: np.percentile(x, 25)}
+    assert radius_agg in agg_map, f'Unknown `radius_agg`: "{radius_agg}"'
+    rad_agg_func = agg_map[radius_agg]
+
+    if tree_method not in {'mst', 'soma_farthest', 'soma_rooted'}:
+        raise ValueError(f'Unknown `tree_method`: "{tree_method}"')
+
+    tree_params = {} if tree_params is None else dict(tree_params)
+
+    if (origin_from_soma or tree_method in {'soma_farthest', 'soma_rooted'}) and soma_mesh is None:
+        raise ValueError('`soma_mesh` is required for soma-aware origins and loop breaking')
+
+    mesh = make_trimesh(mesh, validate=False)
+
+    if origin_from_soma and origins is None:
+        origins = select_wave_origins_from_soma(cell_mesh=mesh,
+                                                soma_mesh=soma_mesh,
+                                                waves=waves,
+                                                strategy=origin_strategy,
+                                                seed=int(tree_params.get('seed', 1985)),
+                                                k_candidates=int(tree_params.get('k_candidates', 5000)))
+
+    node_centers, node_radii, G, vertex_to_node_map = _wavefront_contracted_graph(
+        mesh=mesh,
+        waves=waves,
+        origins=origins,
+        step_size=step_size,
+        rad_agg_func=rad_agg_func,
+        progress=progress,
+        strict_origins=origin_from_soma and origins is not None,
+    )
+
+    out = {
+        'node_centers': node_centers,
+        'node_radii': node_radii,
+        'edges': np.array(G.get_edgelist(), dtype=int),
+        'igraph': G,
+        'mesh': mesh,
+        'mesh_map': vertex_to_node_map,
+    }
+
+    if return_tree_swc:
+        tree_edges = _wavefront_tree_edges(
+            G=G,
+            node_centers=node_centers,
+            node_radii=node_radii,
+            loop_break=tree_method,
+            soma_mesh=soma_mesh,
+            loop_params=tree_params,
+        )
+
+        G_nx = edges_to_graph(edges=np.array(tree_edges, dtype=int),
+                              nodes=np.arange(0, len(G.vs)),
+                              fix_tree=True,
+                              drop_disconnected=False)
+
+        swc = make_swc(G_nx, coords=node_centers, reindex=False, validate=True)
+        swc['radius'] = node_radii[swc.node_id.values]
+        _, new_ids = reindex_swc(swc, inplace=True)
+        tree_mesh_map = np.array([new_ids[n] for n in vertex_to_node_map])
+
+        out['tree_swc'] = swc
+        out['tree_skeleton'] = Skeleton(swc=swc, mesh=mesh, mesh_map=tree_mesh_map,
+                                        method='wavefront')
+
+    return out
+
+
+def _wavefront_contracted_graph(mesh, waves, origins, step_size, rad_agg_func,
+                                progress, strict_origins):
+    """Run wavefront casting and return the simplified contracted graph."""
+    centers_final, radii_final, G = _cast_waves(mesh, waves=waves,
+                                                origins=origins,
+                                                step_size=step_size,
+                                                rad_agg_func=rad_agg_func,
+                                                progress=progress,
+                                                strict_origins=strict_origins)
+
+    node_centers, vertex_to_node_map = np.unique(centers_final,
+                                                 return_inverse=True, axis=0)
+
+    node_radii = pd.DataFrame()
+    node_radii['node_id'] = vertex_to_node_map
+    node_radii['radius'] = radii_final
+    node_radii = node_radii.groupby('node_id').radius.apply(rad_agg_func).values
+
+    G.contract_vertices(vertex_to_node_map)
+    G = G.simplify()
+
+    return node_centers, node_radii, G, vertex_to_node_map
+
+
+def _wavefront_tree_edges(G, node_centers, node_radii, loop_break, soma_mesh, loop_params):
+    """Extract a tree from the contracted graph using historical logic."""
+    el = np.array(G.get_edgelist(), dtype=int)
+
+    if len(el) == 0:
+        return el
+
+    if loop_break == 'mst':
+        if PRESERVE_BACKBONE:
+            weights = _edge_strength_weights(el=el,
+                                             node_radii=node_radii,
+                                             node_centers=node_centers)
+        else:
+            weights = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
+
+        tree = G.spanning_tree(weights=1 / weights)
+        return np.array(tree.get_edgelist(), dtype=int)
+
+    soma_mesh = make_trimesh(soma_mesh, validate=False)
+    return _soma_aware_tree_edges(G=G,
+                                  node_centers=node_centers,
+                                  node_radii=node_radii,
+                                  soma_mesh=soma_mesh,
+                                  mode=loop_break,
+                                  loop_params=loop_params)
 
 
 def select_wave_origins_from_soma(cell_mesh, soma_mesh, waves: int,
@@ -734,6 +851,55 @@ def dotprops(x, k=20):
     alpha = (s[:, 0] - s[:, 1]) / np.sum(s, axis=1)
 
     return vect, alpha
+
+
+def _selftest_keep_loops():
+    """Lightweight sanity checks for loop-preserving wavefront return path."""
+    edges_cycle = np.array([[0, 1], [1, 2], [2, 0]], dtype=int)
+    node_centers = np.array([[0.0, 0.0, 0.0],
+                             [1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0]])
+    node_radii = np.array([1.0, 1.0, 1.0])
+    mesh_map = np.array([0, 1, 2], dtype=int)
+    G_cycle = ig.Graph(edges=edges_cycle, directed=False)
+
+    mesh_stub = type('MeshStub', (), {
+        'vertices': node_centers,
+        'faces': np.array([[0, 1, 2]], dtype=int)
+    })()
+
+    original_contract = _wavefront_contracted_graph
+    original_make_trimesh = make_trimesh
+    try:
+        def _fake_contracted_graph(**kwargs):
+            return node_centers, node_radii, G_cycle.copy(), mesh_map
+
+        def _fake_make_trimesh(mesh, validate=False):
+            return mesh
+
+        globals()['_wavefront_contracted_graph'] = _fake_contracted_graph
+        globals()['make_trimesh'] = _fake_make_trimesh
+
+        out = by_wavefront_keep_loops(mesh_stub,
+                                      waves=1,
+                                      progress=False,
+                                      return_tree_swc=False)
+        assert out['edges'].shape[0] >= out['node_centers'].shape[0]
+
+        out_tree = by_wavefront_keep_loops(mesh_stub,
+                                           waves=1,
+                                           progress=False,
+                                           return_tree_swc=True,
+                                           tree_method='mst')
+        n_nodes = out_tree['node_centers'].shape[0]
+        n_tree_edges = int((out_tree['tree_swc'].parent_id.values >= 0).sum())
+        assert n_tree_edges == n_nodes - 1
+        assert out_tree['edges'].shape[0] >= n_nodes
+    finally:
+        globals()['_wavefront_contracted_graph'] = original_contract
+        globals()['make_trimesh'] = original_make_trimesh
+
+    return True
 
 
 def _self_test_soma_loop_break():
