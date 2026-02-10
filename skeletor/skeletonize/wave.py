@@ -184,18 +184,13 @@ def by_wavefront_keep_loops(mesh,
                             return_tree_swc: bool = False,
                             tree_method: str = 'mst',
                             tree_params: dict | None = None):
-    """Skeletonize a mesh by wavefront contraction while preserving cycles.
+    """Skeletonize a mesh by wavefront contraction and return a Skeleton.
 
-    This follows the same wavefront contraction pipeline as :func:`by_wavefront`
-    but stops before loop-breaking. The returned ``edges`` are the full
-    simplified contracted graph and therefore may contain cycles. This is useful
-    when custom loop breaking is required downstream.
-
-    Notes
-    -----
-    SWC cannot encode loops. If ``return_tree_swc=True``, a tree is extracted
-    only as a convenience export/visualization product while loop-preserving
-    graph outputs are still returned unchanged.
+    The loop-preserving contracted graph is retained on the returned skeleton
+    via ``loop_*`` attributes (e.g. ``loop_edges`` and ``loop_igraph``), while
+    the SWC representation is generated from a tree extracted according to
+    ``tree_method``. This keeps the output compatible with the standard
+    skeletor pipeline (e.g. ``save_swc``) while still exposing cycle metadata.
     """
     agg_map = {'mean': np.mean, 'max': np.max, 'min': np.min,
                'median': np.median,
@@ -232,40 +227,37 @@ def by_wavefront_keep_loops(mesh,
         strict_origins=origin_from_soma and origins is not None,
     )
 
-    out = {
-        'node_centers': node_centers,
-        'node_radii': node_radii,
-        'edges': np.array(G.get_edgelist(), dtype=int),
-        'igraph': G,
-        'mesh': mesh,
-        'mesh_map': vertex_to_node_map,
-    }
+    tree_edges = _wavefront_tree_edges(
+        G=G,
+        node_centers=node_centers,
+        node_radii=node_radii,
+        loop_break=tree_method,
+        soma_mesh=soma_mesh,
+        loop_params=tree_params,
+    )
+
+    G_nx = edges_to_graph(edges=np.array(tree_edges, dtype=int),
+                          nodes=np.arange(0, len(G.vs)),
+                          fix_tree=True,
+                          drop_disconnected=False)
+
+    swc = make_swc(G_nx, coords=node_centers, reindex=False, validate=True)
+    swc['radius'] = node_radii[swc.node_id.values]
+    _, new_ids = reindex_swc(swc, inplace=True)
+    tree_mesh_map = np.array([new_ids[n] for n in vertex_to_node_map])
+
+    skeleton = Skeleton(swc=swc, mesh=mesh, mesh_map=tree_mesh_map,
+                        method='wavefront')
+    skeleton.loop_node_centers = node_centers
+    skeleton.loop_node_radii = node_radii
+    skeleton.loop_edges = np.array(G.get_edgelist(), dtype=int)
+    skeleton.loop_igraph = G
+    skeleton.loop_vertex_to_node_map = vertex_to_node_map
 
     if return_tree_swc:
-        tree_edges = _wavefront_tree_edges(
-            G=G,
-            node_centers=node_centers,
-            node_radii=node_radii,
-            loop_break=tree_method,
-            soma_mesh=soma_mesh,
-            loop_params=tree_params,
-        )
+        skeleton.tree_swc = swc.copy()
 
-        G_nx = edges_to_graph(edges=np.array(tree_edges, dtype=int),
-                              nodes=np.arange(0, len(G.vs)),
-                              fix_tree=True,
-                              drop_disconnected=False)
-
-        swc = make_swc(G_nx, coords=node_centers, reindex=False, validate=True)
-        swc['radius'] = node_radii[swc.node_id.values]
-        _, new_ids = reindex_swc(swc, inplace=True)
-        tree_mesh_map = np.array([new_ids[n] for n in vertex_to_node_map])
-
-        out['tree_swc'] = swc
-        out['tree_skeleton'] = Skeleton(swc=swc, mesh=mesh, mesh_map=tree_mesh_map,
-                                        method='wavefront')
-
-    return out
+    return skeleton
 
 
 def _wavefront_contracted_graph(mesh, waves, origins, step_size, rad_agg_func,
@@ -884,17 +876,18 @@ def _selftest_keep_loops():
                                       waves=1,
                                       progress=False,
                                       return_tree_swc=False)
-        assert out['edges'].shape[0] >= out['node_centers'].shape[0]
+        assert isinstance(out, Skeleton)
+        assert out.loop_edges.shape[0] >= out.loop_node_centers.shape[0]
 
         out_tree = by_wavefront_keep_loops(mesh_stub,
                                            waves=1,
                                            progress=False,
                                            return_tree_swc=True,
                                            tree_method='mst')
-        n_nodes = out_tree['node_centers'].shape[0]
-        n_tree_edges = int((out_tree['tree_swc'].parent_id.values >= 0).sum())
+        n_nodes = out_tree.loop_node_centers.shape[0]
+        n_tree_edges = int((out_tree.tree_swc.parent_id.values >= 0).sum())
         assert n_tree_edges == n_nodes - 1
-        assert out_tree['edges'].shape[0] >= n_nodes
+        assert out_tree.loop_edges.shape[0] >= n_nodes
     finally:
         globals()['_wavefront_contracted_graph'] = original_contract
         globals()['make_trimesh'] = original_make_trimesh
