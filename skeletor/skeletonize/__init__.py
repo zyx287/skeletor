@@ -51,5 +51,5 @@ from .teasar import *
 from .tangent_ball import *
 
 __docformat__ = "numpy"
-__all__ = ['by_teasar', 'by_wavefront', 'by_vertex_clusters',
-           'by_edge_collapse', 'by_tangent_ball']
+__all__ = ['by_teasar', 'by_wavefront', 'select_wave_origins_from_soma',
+           'by_vertex_clusters', 'by_edge_collapse', 'by_tangent_ball']

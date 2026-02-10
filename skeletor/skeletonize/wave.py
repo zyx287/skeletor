@@ -27,7 +27,7 @@ from ..utilities import make_trimesh
 from .base import Skeleton
 from .utils import make_swc, reindex_swc, edges_to_graph
 
-__all__ = ['by_wavefront']
+__all__ = ['by_wavefront', 'select_wave_origins_from_soma']
 
 # This flag determines whether we use inverse radii or edge lengths for the MST.
 # Radii make more sense if working with tubular structures like neurons but this
@@ -40,7 +40,12 @@ def by_wavefront(mesh,
                  origins=None,
                  step_size=1,
                  radius_agg='mean',
-                 progress=True):
+                 progress=True,
+                 soma_mesh=None,
+                 origin_from_soma: bool = False,
+                 origin_strategy: str = 'soma_surface_fps',
+                 loop_break: str = 'auto',
+                 loop_params: dict = None):
     """Skeletonize a mesh using wave fronts.
 
     The algorithm tries to find rings of vertices and collapse them to
@@ -79,6 +84,21 @@ def by_wavefront(mesh,
                     vertices forming a ring that we collapse to its center).
     progress :      bool
                     If True, will show progress bar.
+    soma_mesh :     mesh obj, optional
+                    Soma mesh used for soma-aware origin selection and soma-aware
+                    loop breaking.
+    origin_from_soma : bool
+                    If True and ``origins`` is None, wave origins are selected
+                    from ``soma_mesh`` via ``select_wave_origins_from_soma``.
+    origin_strategy : str
+                    Origin selection strategy passed to
+                    ``select_wave_origins_from_soma``.
+    loop_break :    "auto" | "mst" | "soma_farthest" | "soma_rooted"
+                    Cycle-breaking strategy after graph contraction. ``auto``
+                    uses ``soma_farthest`` when soma information is provided,
+                    otherwise falls back to historical ``mst`` behavior.
+    loop_params :   dict, optional
+                    Parameters for soma-aware loop breaking.
 
     Returns
     -------
@@ -94,13 +114,32 @@ def by_wavefront(mesh,
     assert radius_agg in agg_map, f'Unknown `radius_agg`: "{radius_agg}"'
     rad_agg_func = agg_map[radius_agg]
 
+    if loop_break not in {'auto', 'mst', 'soma_farthest', 'soma_rooted'}:
+        raise ValueError(f'Unknown `loop_break`: "{loop_break}"')
+
+    loop_params = {} if loop_params is None else dict(loop_params)
+    if loop_break == 'auto':
+        loop_break = 'soma_farthest' if soma_mesh is not None else 'mst'
+
+    if (origin_from_soma or loop_break in {'soma_farthest', 'soma_rooted'}) and soma_mesh is None:
+        raise ValueError('`soma_mesh` is required for soma-aware origins and loop breaking')
+
     mesh = make_trimesh(mesh, validate=False)
+
+    if origin_from_soma and origins is None:
+        origins = select_wave_origins_from_soma(cell_mesh=mesh,
+                                                soma_mesh=soma_mesh,
+                                                waves=waves,
+                                                strategy=origin_strategy,
+                                                seed=int(loop_params.get('seed', 1985)),
+                                                k_candidates=int(loop_params.get('k_candidates', 5000)))
 
     centers_final, radii_final, G = _cast_waves(mesh, waves=waves,
                                                 origins=origins,
                                                 step_size=step_size,
                                                 rad_agg_func=rad_agg_func,
-                                                progress=progress)
+                                                progress=progress,
+                                                strict_origins=origin_from_soma and origins is not None)
 
     # Collapse vertices into nodes
     (node_centers,
@@ -121,31 +160,31 @@ def by_wavefront(mesh,
     G = G.simplify()
 
     # Generate hierarchical tree
-    el = np.array(G.get_edgelist())
+    el = np.array(G.get_edgelist(), dtype=int)
 
-    if PRESERVE_BACKBONE:
-        # Use the minimum radius between vertices in an edge
-        weights_rad = np.vstack((node_radii[el[:, 0]],
-                                 node_radii[el[:, 1]])).mean(axis=0)
+    if len(el) == 0:
+        tree_edges = el
+    elif loop_break == 'mst':
+        if PRESERVE_BACKBONE:
+            weights = _edge_strength_weights(el=el,
+                                             node_radii=node_radii,
+                                             node_centers=node_centers)
+        else:
+            weights = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
 
-        # For each node generate a vector based on its immediate neighbors
-        vect, alpha = dotprops(node_centers)
-        weights_alpha = np.vstack((alpha[el[:, 0]],
-                                   alpha[el[:, 1]])).mean(axis=0)
-
-        # Combine both which means we are most likely to cut at small branches
-        # outside of the backbone
-        weights = weights_rad * weights_alpha
-
-        # MST doesn't like 0 for weights
-        weights[weights <= 0] = weights[weights > 0].min() / 2
-
+        tree = G.spanning_tree(weights=1 / weights)
+        tree_edges = np.array(tree.get_edgelist(), dtype=int)
     else:
-        weights = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
-    tree = G.spanning_tree(weights=1 / weights)
+        soma_mesh = make_trimesh(soma_mesh, validate=False)
+        tree_edges = _soma_aware_tree_edges(G=G,
+                                            node_centers=node_centers,
+                                            node_radii=node_radii,
+                                            soma_mesh=soma_mesh,
+                                            mode=loop_break,
+                                            loop_params=loop_params)
 
     # Create a directed acyclic and hierarchical graph
-    G_nx = edges_to_graph(edges=np.array(tree.get_edgelist()),
+    G_nx = edges_to_graph(edges=np.array(tree_edges, dtype=int),
                           nodes=np.arange(0, len(G.vs)),
                           fix_tree=True,  # this makes sure graph is oriented
                           drop_disconnected=False)
@@ -162,13 +201,231 @@ def by_wavefront(mesh,
                     method='wavefront')
 
 
+def select_wave_origins_from_soma(cell_mesh, soma_mesh, waves: int,
+                                  strategy: str = 'soma_surface_fps',
+                                  seed: int = 1985,
+                                  k_candidates: int = 5000) -> np.ndarray:
+    """Return soma-aware seed vertex IDs on the cell mesh."""
+    cell_mesh = make_trimesh(cell_mesh, validate=False)
+    soma_mesh = make_trimesh(soma_mesh, validate=False)
+
+    waves = int(waves)
+    if waves < 1:
+        raise ValueError('`waves` must be integer >= 1')
+
+    if strategy not in {'soma_surface_fps', 'soma_surface_random', 'soma_center_knn'}:
+        raise ValueError(f'Unknown `strategy`: "{strategy}"')
+
+    rng = np.random.RandomState(seed)
+    cell_vertices = np.asarray(cell_mesh.vertices)
+    soma_vertices = np.asarray(soma_mesh.vertices)
+
+    if len(cell_vertices) == 0 or len(soma_vertices) == 0:
+        return np.array([], dtype=int)
+
+    tree = cKDTree(cell_vertices)
+    soma_centroid = soma_vertices.mean(axis=0)
+
+    if strategy in {'soma_surface_fps', 'soma_surface_random'}:
+        nearest = tree.query(soma_vertices, k=1)[1]
+        candidates = np.unique(np.asarray(nearest, dtype=int))
+    else:
+        k = min(len(cell_vertices), int(k_candidates))
+        if k < 1:
+            return np.array([], dtype=int)
+        nearest = tree.query(soma_centroid.reshape(1, -1), k=k)[1]
+        candidates = np.unique(np.asarray(nearest, dtype=int).reshape(-1))
+
+    if len(candidates) == 0:
+        return np.array([], dtype=int)
+
+    n_select = min(waves, len(candidates))
+    if strategy == 'soma_surface_random':
+        return rng.choice(candidates, size=n_select, replace=False).astype(int)
+
+    candidate_xyz = cell_vertices[candidates]
+    start_ix = int(np.argmin(np.linalg.norm(candidate_xyz - soma_centroid, axis=1)))
+    return _farthest_point_sample_indices(candidates,
+                                          candidate_xyz,
+                                          n_select=n_select,
+                                          seed_pos=start_ix).astype(int)
+
+
+def _edge_strength_weights(el, node_radii, node_centers):
+    """Historical backbone-preserving weights for MST mode."""
+    # Use the minimum radius between vertices in an edge
+    weights_rad = np.vstack((node_radii[el[:, 0]],
+                             node_radii[el[:, 1]])).mean(axis=0)
+
+    # For each node generate a vector based on its immediate neighbors
+    _, alpha = dotprops(node_centers)
+    weights_alpha = np.vstack((alpha[el[:, 0]],
+                               alpha[el[:, 1]])).mean(axis=0)
+
+    # Combine both which means we are most likely to cut at small branches
+    # outside of the backbone
+    weights = weights_rad * weights_alpha
+
+    # MST doesn't like 0 for weights
+    if np.any(weights > 0):
+        weights[weights <= 0] = weights[weights > 0].min() / 2
+    else:
+        weights[:] = 1
+
+    return weights
+
+
+def _farthest_point_sample_indices(candidates, candidate_xyz, n_select, seed_pos=0):
+    """Farthest-point-sample candidate IDs in O(n_select * n_candidates)."""
+    if n_select <= 0 or len(candidates) == 0:
+        return np.array([], dtype=int)
+
+    seed_pos = int(seed_pos)
+    selected_pos = [seed_pos]
+    min_dist = np.linalg.norm(candidate_xyz - candidate_xyz[seed_pos], axis=1)
+    min_dist[seed_pos] = -np.inf
+
+    while len(selected_pos) < n_select:
+        nxt = int(np.argmax(min_dist))
+        selected_pos.append(nxt)
+        dist = np.linalg.norm(candidate_xyz - candidate_xyz[nxt], axis=1)
+        min_dist = np.minimum(min_dist, dist)
+        min_dist[selected_pos] = -np.inf
+
+    return np.asarray(candidates)[np.asarray(selected_pos, dtype=int)]
+
+
+def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_params):
+    """Build tree edges with soma-aware cycle handling."""
+    el = np.array(G.get_edgelist(), dtype=int)
+    if len(el) == 0:
+        return el
+
+    edge_len = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
+    vect, alpha = dotprops(node_centers)
+
+    # Backbone strength
+    strength = np.vstack((node_radii[el[:, 0]], node_radii[el[:, 1]])).mean(axis=0)
+    strength *= np.vstack((alpha[el[:, 0]], alpha[el[:, 1]])).mean(axis=0)
+    if np.any(strength > 0):
+        strength[strength <= 0] = strength[strength > 0].min() / 2
+    else:
+        strength[:] = 1
+
+    # Soma roots and graph distance-to-soma
+    root_nodes = cKDTree(node_centers).query(np.asarray(soma_mesh.vertices), k=1)[1]
+    root_nodes = np.unique(np.asarray(root_nodes, dtype=int))
+    if len(root_nodes) == 0:
+        root_nodes = np.array([0], dtype=int)
+
+    G.es['len'] = edge_len
+    dist_mat = np.array(G.distances(source=root_nodes.tolist(), weights='len'))
+    dist_to_soma = dist_mat.min(axis=0)
+
+    # Suspicion score
+    eps = 1e-12
+    ru = node_radii[el[:, 0]]
+    rv = node_radii[el[:, 1]]
+    thinness = 1 - (np.minimum(ru, rv) / np.maximum(np.maximum(ru, rv), eps))
+    misalign = 1 - np.abs(np.sum(vect[el[:, 0]] * vect[el[:, 1]], axis=1))
+    du = dist_to_soma[el[:, 0]]
+    dv = dist_to_soma[el[:, 1]]
+    sideways = 1 - np.clip(np.abs(du - dv) / (edge_len + eps), 0, 1)
+
+    a = float(loop_params.get('a', 3.0))
+    b = float(loop_params.get('b', 2.0))
+    c = float(loop_params.get('c', 4.0))
+    suspicion = a * thinness + b * misalign + c * sideways
+
+    if mode == 'soma_farthest':
+        # near-first Kruskal key: (d_edge ASC, suspicion ASC, strength DESC, edge_len ASC)
+        d_edge = np.maximum(du, dv)
+        order = np.lexsort((edge_len, -strength, suspicion, d_edge))
+        keep_ix = _kruskal_choose_edges(len(G.vs), el, order)
+        return el[keep_ix]
+
+    if mode != 'soma_rooted':
+        raise ValueError(f'Unknown soma-aware loop break mode: "{mode}"')
+
+    # Rooted mode: assign each node a parent towards soma
+    w_len = float(loop_params.get('w_len', 1.0))
+    w_susp = float(loop_params.get('w_susp', 1.0))
+    w_strength = float(loop_params.get('w_strength', 1.0))
+
+    edge_lookup = {tuple(sorted((int(u), int(v)))): i for i, (u, v) in enumerate(el)}
+    roots = set(root_nodes.tolist())
+    chosen = set()
+
+    for v in np.argsort(-dist_to_soma):
+        v = int(v)
+        if v in roots:
+            continue
+        nbrs = np.array(G.neighbors(v), dtype=int)
+        if len(nbrs) == 0:
+            continue
+
+        closer = nbrs[dist_to_soma[nbrs] < dist_to_soma[v]]
+        if len(closer) == 0:
+            closer = np.array([nbrs[np.argmin(dist_to_soma[nbrs])]], dtype=int)
+
+        best_parent = None
+        best_cost = np.inf
+        for p in closer:
+            p = int(p)
+            eix = edge_lookup.get(tuple(sorted((v, p))))
+            if eix is None:
+                continue
+            cost = w_len * edge_len[eix] + w_susp * suspicion[eix] - w_strength * strength[eix]
+            if cost < best_cost:
+                best_cost = cost
+                best_parent = p
+
+        if best_parent is not None:
+            chosen.add(tuple(sorted((v, best_parent))))
+
+    return np.array(sorted(chosen), dtype=int)
+
+
+def _kruskal_choose_edges(n_nodes, edges, order):
+    """Union-find Kruskal helper returning selected edge indices."""
+    parent = np.arange(n_nodes, dtype=int)
+    rank = np.zeros(n_nodes, dtype=int)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return False
+        if rank[rx] < rank[ry]:
+            parent[rx] = ry
+        elif rank[rx] > rank[ry]:
+            parent[ry] = rx
+        else:
+            parent[ry] = rx
+            rank[rx] += 1
+        return True
+
+    chosen = []
+    for idx in order:
+        u, v = edges[int(idx)]
+        if union(int(u), int(v)):
+            chosen.append(int(idx))
+
+    return np.array(chosen, dtype=int)
+
+
 def _cast_waves(mesh, waves=1, origins=None, step_size=1,
-                rad_agg_func=np.mean, progress=True):
+                rad_agg_func=np.mean, progress=True, strict_origins=False):
     """Cast waves across mesh."""
     if not isinstance(origins, type(None)):
         if isinstance(origins, int):
             origins = [origins]
-        elif not isinstance(origins, (set, list)):
+        elif not isinstance(origins, (set, list, np.ndarray)):
             raise TypeError('`origins` must be vertex ID (int) or list '
                             f'thereof, got "{type(origins)}"')
         origins = np.asarray(origins).astype(int)
@@ -187,7 +444,6 @@ def _cast_waves(mesh, waves=1, origins=None, step_size=1,
 
     # Generate Graph (must be undirected)
     G = ig.Graph(edges=mesh.edges_unique, directed=False)
-    #G.es['weight'] = mesh.edges_unique_length
 
     # Prepare empty array to fill with centers
     centers = np.full((mesh.vertices.shape[0], 3, waves), fill_value=np.nan)
@@ -204,6 +460,7 @@ def _cast_waves(mesh, waves=1, origins=None, step_size=1,
             n_waves = min(waves, len(cc))
             pot_seeds = np.arange(len(cc))
             np.random.seed(1985)  # make seeds predictable
+
             # See if we can use any origins
             if len(origins):
                 # Get those origins in this cc
@@ -214,14 +471,25 @@ def _cast_waves(mesh, waves=1, origins=None, step_size=1,
                     seeds = np.array([cc_map[o] for o in origins[in_cc]])
                 else:
                     seeds = np.array([])
+
                 if len(seeds) < n_waves:
-                    remaining_seeds = pot_seeds[~np.isin(pot_seeds, seeds)]
-                    seeds = np.append(seeds,
-                                      np.random.choice(remaining_seeds,
-                                                       size=n_waves - len(seeds),
-                                                       replace=False))
+                    if strict_origins and len(seeds) > 0:
+                        seeds = np.append(seeds,
+                                          np.random.choice(seeds,
+                                                           size=n_waves - len(seeds),
+                                                           replace=True))
+                    elif strict_origins and len(seeds) == 0:
+                        n_waves = 1
+                        seeds = np.array([pot_seeds[0]], dtype=int)
+                    else:
+                        remaining_seeds = pot_seeds[~np.isin(pot_seeds, seeds)]
+                        seeds = np.append(seeds,
+                                          np.random.choice(remaining_seeds,
+                                                           size=n_waves - len(seeds),
+                                                           replace=False))
             else:
                 seeds = np.random.choice(pot_seeds, size=n_waves, replace=False)
+
             seeds = seeds.astype(int)
 
             # Get the distance between the seeds and all other nodes
@@ -290,3 +558,54 @@ def dotprops(x, k=20):
     alpha = (s[:, 0] - s[:, 1]) / np.sum(s, axis=1)
 
     return vect, alpha
+
+
+def _self_test_soma_loop_break():
+    """Lightweight sanity checks for soma-aware cycle breaking."""
+    # Near-soma suspicious shortcut: edge (1, 2) links equal-distance nodes.
+    centers_near = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [2.0, 2.0, 0.0],
+    ])
+    radii_near = np.array([2.0, 2.0, 2.0, 1.0])
+    edges_near = np.array([[0, 1], [0, 2], [1, 2], [1, 3], [2, 3]])
+    G_near = ig.Graph(edges=edges_near, directed=False)
+
+    soma_mesh_near = type('SomaMeshNear', (), {'vertices': centers_near[[0]]})
+    tree_near = _soma_aware_tree_edges(G_near, centers_near, radii_near,
+                                       soma_mesh_near, 'soma_farthest',
+                                       {'a': 3.0, 'b': 2.0, 'c': 8.0})
+    near_set = {tuple(sorted(e)) for e in tree_near.tolist()}
+    assert (1, 2) not in near_set
+
+    # Far cycle should be broken at the far shortcut edge.
+    centers_far = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [12.0, 0.0, 0.0],
+        [11.0, 0.1, 0.0],
+    ])
+    radii_far = np.array([2.0, 2.0, 2.0, 1.8, 1.2, 1.2, 0.2])
+    edges_far = np.array([
+        [0, 1], [1, 2], [2, 3], [3, 4],
+        [4, 5], [5, 6], [4, 6],
+    ])
+    G_far = ig.Graph(edges=edges_far, directed=False)
+    soma_mesh_far = type('SomaMeshFar', (), {'vertices': centers_far[[0, 1]]})
+
+    tree_far = _soma_aware_tree_edges(G_far, centers_far, radii_far,
+                                      soma_mesh_far, 'soma_farthest', {})
+    far_set = {tuple(sorted(e)) for e in tree_far.tolist()}
+    assert (5, 6) not in far_set
+
+    tree_rooted = _soma_aware_tree_edges(G_far, centers_far, radii_far,
+                                         soma_mesh_far, 'soma_rooted', {})
+    rooted_set = {tuple(sorted(e)) for e in tree_rooted.tolist()}
+    assert any(0 in e or 1 in e for e in rooted_set)
+
+    return True
