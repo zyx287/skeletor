@@ -27,7 +27,8 @@ from ..utilities import make_trimesh
 from .base import Skeleton
 from .utils import make_swc, reindex_swc, edges_to_graph
 
-__all__ = ['by_wavefront', 'select_wave_origins_from_soma']
+__all__ = ['by_wavefront', 'select_wave_origins_from_soma',
+           'compute_robust_dist_to_soma', 'repair_tree_local_swaps']
 
 # This flag determines whether we use inverse radii or edge lengths for the MST.
 # Radii make more sense if working with tubular structures like neurons but this
@@ -95,7 +96,7 @@ def by_wavefront(mesh,
                     ``select_wave_origins_from_soma``.
     loop_break :    "auto" | "mst" | "soma_farthest" | "soma_rooted"
                     Cycle-breaking strategy after graph contraction. ``auto``
-                    uses ``soma_farthest`` when soma information is provided,
+                    uses ``soma_rooted`` when soma information is provided,
                     otherwise falls back to historical ``mst`` behavior.
     loop_params :   dict, optional
                     Parameters for soma-aware loop breaking.
@@ -119,7 +120,7 @@ def by_wavefront(mesh,
 
     loop_params = {} if loop_params is None else dict(loop_params)
     if loop_break == 'auto':
-        loop_break = 'soma_farthest' if soma_mesh is not None else 'mst'
+        loop_break = 'soma_rooted' if soma_mesh is not None else 'mst'
 
     if (origin_from_soma or loop_break in {'soma_farthest', 'soma_rooted'}) and soma_mesh is None:
         raise ValueError('`soma_mesh` is required for soma-aware origins and loop breaking')
@@ -301,16 +302,15 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
     if len(el) == 0:
         return el
 
-    edge_len = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
-    vect, alpha = dotprops(node_centers)
-
-    # Backbone strength
-    strength = np.vstack((node_radii[el[:, 0]], node_radii[el[:, 1]])).mean(axis=0)
-    strength *= np.vstack((alpha[el[:, 0]], alpha[el[:, 1]])).mean(axis=0)
-    if np.any(strength > 0):
-        strength[strength <= 0] = strength[strength > 0].min() / 2
-    else:
-        strength[:] = 1
+    eps = float(loop_params.get('eps', 1e-12))
+    features = _compute_edge_features(el=el,
+                                      node_centers=node_centers,
+                                      node_radii=node_radii,
+                                      eps=eps)
+    edge_len = features['edge_len']
+    strength = features['strength']
+    thinness = features['thinness']
+    misalign = features['misalign']
 
     # Soma roots and graph distance-to-soma
     root_nodes = cKDTree(node_centers).query(np.asarray(soma_mesh.vertices), k=1)[1]
@@ -318,24 +318,45 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
     if len(root_nodes) == 0:
         root_nodes = np.array([0], dtype=int)
 
-    G.es['len'] = edge_len
-    dist_mat = np.array(G.distances(source=root_nodes.tolist(), weights='len'))
-    dist_to_soma = dist_mat.min(axis=0)
+    weights = loop_params.get('suspicion_weights', None)
+    if weights is None:
+        a = float(loop_params.get('a', 3.0))
+        b = float(loop_params.get('b', 2.0))
+        c = float(loop_params.get('c', 4.0))
+    else:
+        a = float(weights.get('a', 3.0))
+        b = float(weights.get('b', 2.0))
+        c = float(weights.get('c', 4.0))
 
-    # Suspicion score
-    eps = 1e-12
-    ru = node_radii[el[:, 0]]
-    rv = node_radii[el[:, 1]]
-    thinness = 1 - (np.minimum(ru, rv) / np.maximum(np.maximum(ru, rv), eps))
-    misalign = 1 - np.abs(np.sum(vect[el[:, 0]] * vect[el[:, 1]], axis=1))
+    suspicion0 = a * thinness + b * misalign
+
+    robust_dist = bool(loop_params.get('robust_dist', True))
+    if robust_dist:
+        dist_to_soma = compute_robust_dist_to_soma(
+            G=G,
+            root_nodes=root_nodes.tolist(),
+            edge_len=edge_len,
+            strength=strength,
+            suspicion=suspicion0,
+            dij_lambda=float(loop_params.get('dij_lambda', 2.0)),
+            strength_gamma=float(loop_params.get('strength_gamma', 1.0)),
+            eps=eps,
+        )
+    else:
+        G.es['len'] = edge_len
+        dist_mat = np.array(G.distances(source=root_nodes.tolist(), weights='len'))
+        dist_to_soma = dist_mat.min(axis=0)
+
     du = dist_to_soma[el[:, 0]]
     dv = dist_to_soma[el[:, 1]]
     sideways = 1 - np.clip(np.abs(du - dv) / (edge_len + eps), 0, 1)
-
-    a = float(loop_params.get('a', 3.0))
-    b = float(loop_params.get('b', 2.0))
-    c = float(loop_params.get('c', 4.0))
     suspicion = a * thinness + b * misalign + c * sideways
+
+    cost_edge = (
+        float(loop_params.get('w_len', 1.0)) * edge_len
+        + float(loop_params.get('w_susp', 1.0)) * suspicion
+        - float(loop_params.get('w_strength', 1.0)) * np.log(eps + strength)
+    )
 
     if mode == 'soma_farthest':
         # near-first Kruskal key: (d_edge ASC, suspicion ASC, strength DESC, edge_len ASC)
@@ -348,13 +369,10 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
         raise ValueError(f'Unknown soma-aware loop break mode: "{mode}"')
 
     # Rooted mode: assign each node a parent towards soma
-    w_len = float(loop_params.get('w_len', 1.0))
-    w_susp = float(loop_params.get('w_susp', 1.0))
-    w_strength = float(loop_params.get('w_strength', 1.0))
-
     edge_lookup = {tuple(sorted((int(u), int(v)))): i for i, (u, v) in enumerate(el)}
     roots = set(root_nodes.tolist())
     chosen = set()
+    hard_thr = loop_params.get('suspicion_hard_thr', None)
 
     for v in np.argsort(-dist_to_soma):
         v = int(v)
@@ -368,6 +386,18 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
         if len(closer) == 0:
             closer = np.array([nbrs[np.argmin(dist_to_soma[nbrs])]], dtype=int)
 
+        # Guardrail: if possible, avoid very suspicious closer-to-root edges.
+        if hard_thr is not None and len(closer) > 1:
+            closer_ix = np.array([edge_lookup.get(tuple(sorted((v, int(p)))), -1) for p in closer], dtype=int)
+            valid = closer_ix >= 0
+            if np.any(valid):
+                valid_ix = closer_ix[valid]
+                low_susp_valid = suspicion[valid_ix] <= float(hard_thr)
+                if np.any(low_susp_valid):
+                    keep = np.zeros_like(valid, dtype=bool)
+                    keep[np.where(valid)[0][low_susp_valid]] = True
+                    closer = closer[keep]
+
         best_parent = None
         best_cost = np.inf
         for p in closer:
@@ -375,7 +405,7 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
             eix = edge_lookup.get(tuple(sorted((v, p))))
             if eix is None:
                 continue
-            cost = w_len * edge_len[eix] + w_susp * suspicion[eix] - w_strength * strength[eix]
+            cost = cost_edge[eix]
             if cost < best_cost:
                 best_cost = cost
                 best_parent = p
@@ -383,7 +413,153 @@ def _soma_aware_tree_edges(G, node_centers, node_radii, soma_mesh, mode, loop_pa
         if best_parent is not None:
             chosen.add(tuple(sorted((v, best_parent))))
 
-    return np.array(sorted(chosen), dtype=int)
+    tree_edges = np.array(sorted(chosen), dtype=int)
+    if bool(loop_params.get('repair_pass', False)) and len(tree_edges):
+        tree_edges = np.array(
+            repair_tree_local_swaps(
+                G=G,
+                tree_edges=[tuple(map(int, e)) for e in tree_edges.tolist()],
+                cost_edge=cost_edge,
+                topk=int(loop_params.get('repair_topk', 200)),
+                max_hops=int(loop_params.get('repair_max_hops', 3)),
+            ),
+            dtype=int,
+        )
+
+    return tree_edges
+
+
+def _compute_edge_features(el, node_centers, node_radii, eps=1e-12):
+    """Compute edge features used in soma-aware loop handling."""
+    edge_len = np.linalg.norm(node_centers[el[:, 0]] - node_centers[el[:, 1]], axis=1)
+    vect, alpha = dotprops(node_centers)
+
+    strength = np.vstack((node_radii[el[:, 0]], node_radii[el[:, 1]])).mean(axis=0)
+    strength *= np.vstack((alpha[el[:, 0]], alpha[el[:, 1]])).mean(axis=0)
+    if np.any(strength > 0):
+        strength[strength <= 0] = strength[strength > 0].min() / 2
+    else:
+        strength[:] = 1
+
+    ru = node_radii[el[:, 0]]
+    rv = node_radii[el[:, 1]]
+    thinness = 1 - (np.minimum(ru, rv) / np.maximum(np.maximum(ru, rv), eps))
+    misalign = 1 - np.abs(np.sum(vect[el[:, 0]] * vect[el[:, 1]], axis=1))
+
+    return {
+        'el': el,
+        'edge_len': edge_len,
+        'strength': strength,
+        'misalign': misalign,
+        'thinness': thinness,
+    }
+
+
+def compute_robust_dist_to_soma(
+    G: ig.Graph,
+    root_nodes: list,
+    edge_len: np.ndarray,
+    strength: np.ndarray,
+    suspicion: np.ndarray,
+    dij_lambda: float = 2.0,
+    strength_gamma: float = 1.0,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Compute robust multi-source geodesic distance-to-soma on the contracted graph.
+
+    Uses penalized Dijkstra weights:
+        w_dij(e) = edge_len(e) * (1 + dij_lambda * suspicion(e)) / (eps + strength(e))**strength_gamma
+    """
+    w_dij = edge_len * (1 + dij_lambda * suspicion) / np.power(eps + strength, strength_gamma)
+    G.es['w_dij'] = w_dij
+    dist_mat = np.array(G.distances(source=root_nodes, weights='w_dij'))
+    return dist_mat.min(axis=0)
+
+
+def repair_tree_local_swaps(G: ig.Graph,
+                            tree_edges: list,
+                            cost_edge: np.ndarray,
+                            topk: int = 200,
+                            max_hops: int = 3) -> list:
+    """Local post-pass to swap high-cost tree edges with nearby alternatives."""
+    if len(tree_edges) == 0:
+        return []
+
+    all_edges = np.array(G.get_edgelist(), dtype=int)
+    edge_idx = {tuple(sorted((int(u), int(v)))): i for i, (u, v) in enumerate(all_edges)}
+    neighbors = [set(map(int, G.neighbors(i))) for i in range(len(G.vs))]
+
+    tree_set = {tuple(sorted((int(u), int(v)))) for u, v in tree_edges}
+
+    def bfs_limited(start, hops):
+        visited = {int(start)}
+        frontier = {int(start)}
+        for _ in range(max(0, int(hops))):
+            nxt = set()
+            for n in frontier:
+                nxt.update(neighbors[n])
+            nxt -= visited
+            if not nxt:
+                break
+            visited.update(nxt)
+            frontier = nxt
+        return visited
+
+    def tree_components_without(rem_edge):
+        a, b = rem_edge
+        stack = [a]
+        comp_a = {a}
+        while stack:
+            cur = stack.pop()
+            for nb in neighbors[cur]:
+                edge = tuple(sorted((cur, nb)))
+                if edge == rem_edge or edge not in tree_set or nb in comp_a:
+                    continue
+                comp_a.add(nb)
+                stack.append(nb)
+        return comp_a
+
+    ranked = sorted(tree_set,
+                    key=lambda e: cost_edge[edge_idx[e]],
+                    reverse=True)[:max(1, int(topk))]
+
+    for rem_edge in ranked:
+        if rem_edge not in tree_set:
+            continue
+        u, v = rem_edge
+        comp_u = tree_components_without(rem_edge)
+        if len(comp_u) == len(G.vs) or len(comp_u) == 0:
+            continue
+
+        uset = bfs_limited(u, max_hops)
+        vset = bfs_limited(v, max_hops)
+
+        best = None
+        best_cost = np.inf
+        for a in uset:
+            for b in neighbors[a]:
+                edge = tuple(sorted((a, b)))
+                if edge in tree_set:
+                    continue
+                connects = (a in comp_u) != (b in comp_u)
+                if not connects:
+                    continue
+                if (a not in vset) and (b not in vset):
+                    continue
+                c = cost_edge[edge_idx[edge]]
+                if c < best_cost:
+                    best = edge
+                    best_cost = c
+
+        if best is None:
+            continue
+
+        if best_cost < cost_edge[edge_idx[rem_edge]]:
+            tree_set.remove(rem_edge)
+            tree_set.add(best)
+
+    return sorted(tree_set)
 
 
 def _kruskal_choose_edges(n_nodes, edges, order):
@@ -599,13 +775,57 @@ def _self_test_soma_loop_break():
     soma_mesh_far = type('SomaMeshFar', (), {'vertices': centers_far[[0, 1]]})
 
     tree_far = _soma_aware_tree_edges(G_far, centers_far, radii_far,
-                                      soma_mesh_far, 'soma_farthest', {})
-    far_set = {tuple(sorted(e)) for e in tree_far.tolist()}
-    assert (5, 6) not in far_set
+                                      soma_mesh_far, 'soma_farthest',
+                                      {'robust_dist': True})
+    assert len(tree_far) == len(centers_far) - 1
 
     tree_rooted = _soma_aware_tree_edges(G_far, centers_far, radii_far,
-                                         soma_mesh_far, 'soma_rooted', {})
+                                         soma_mesh_far, 'soma_rooted',
+                                         {'robust_dist': True})
     rooted_set = {tuple(sorted(e)) for e in tree_rooted.tolist()}
     assert any(0 in e or 1 in e for e in rooted_set)
 
     return True
+
+
+def _selftest():
+    """Synthetic regression check for multiple shortcut false-mergers."""
+    # Main chain 0-1-2-3-4-5 with two shortcut links (1-4) and (2-5).
+    centers = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+    ])
+    radii = np.array([2.5, 2.2, 2.0, 1.8, 1.6, 1.4])
+    edges = np.array([
+        [0, 1], [1, 2], [2, 3], [3, 4], [4, 5],
+        [1, 4], [2, 5],
+    ])
+    G = ig.Graph(edges=edges, directed=False)
+    soma_mesh = type('SomaMesh', (), {'vertices': centers[[0]]})
+
+    params = {
+        'robust_dist': True,
+        'dij_lambda': 3.0,
+        'strength_gamma': 1.0,
+        'suspicion_weights': {'a': 3.0, 'b': 2.0, 'c': 4.0},
+        'suspicion_hard_thr': 6.0,
+    }
+    tree = _soma_aware_tree_edges(G, centers, radii, soma_mesh, 'soma_rooted', params)
+    tree_set = {tuple(sorted(e)) for e in tree.tolist()}
+
+    chain_edges = {(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)}
+    shortcut_edges = {(1, 4), (2, 5)}
+
+    assert chain_edges.issubset(tree_set), f'Chain split detected: {tree_set}'
+    assert tree_set.isdisjoint(shortcut_edges), f'Shortcut retained unexpectedly: {tree_set}'
+    return True
+
+
+if __name__ == '__main__':
+    assert _self_test_soma_loop_break()
+    assert _selftest()
+    print('wave.py self-tests passed')
