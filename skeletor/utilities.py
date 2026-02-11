@@ -420,7 +420,24 @@ def export_loops_to_swc(loop_info: dict,
                         file_prefix: str = 'loop',
                         break_on_dropped_edge: bool = True,
                         dropped_edge_name_in_header: bool = True) -> list[str]:
-    """Export one SWC per inferred loop from ``loop_info['loops']``."""
+    """Export one SWC per inferred loop from ``loop_info['loops']``.
+
+    Parameters
+    ----------
+    loop_info : dict
+        Output from :func:`extract_loop_node_sets` or
+        :func:`loop_node_sets_from_result`.
+    loop_node_centers : (N, 3) array
+        Loop-node coordinates in loop-graph index space.
+    loop_node_radii : (N,) array, optional
+        Optional loop-node radii in loop-graph index space.
+
+    Notes
+    -----
+    ``loop_info['loops'][i]['node_ids']`` are interpreted as loop-graph IDs,
+    i.e. indices into ``loop_node_centers`` / ``loop_node_radii``.
+    They are not assumed to match SWC ``node_id`` values.
+    """
     loops = list(loop_info.get('loops', []))
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -509,6 +526,42 @@ def export_loops_to_swc_from_skeleton(skeleton: 'Skeleton',
     Loop node IDs from loop utilities are interpreted in loop-graph index
     space and exported from ``skeleton.loop_node_centers`` / radii where
     available.
+
+    Examples
+    --------
+    Export inferred loops after ``by_wavefront_keep_loops(..., return_swc=True)``:
+
+    >>> import skeletor as sk
+    >>> from skeletor.utilities import (
+    ...     loop_node_sets_from_result,
+    ...     export_loops_to_swc,
+    ... )
+    >>> skel_wave = sk.skeletonize.by_wavefront_keep_loops(
+    ...     fixed,
+    ...     waves=1,
+    ...     step_size=step_size,
+    ...     soma_mesh=soma_mesh,
+    ...     return_swc=True,
+    ...     progress=False,
+    ... )
+    >>> loop_info = loop_node_sets_from_result(skeleton=skel_wave, deduplicate=True)
+    >>> files = export_loops_to_swc(
+    ...     loop_info=loop_info,
+    ...     loop_node_centers=skel_wave.loop_node_centers,
+    ...     loop_node_radii=getattr(skel_wave, 'loop_node_radii', None),
+    ...     out_dir='loop_swcs',
+    ...     file_prefix='loop',
+    ... )
+
+    Or use the convenience wrapper:
+
+    >>> from skeletor.utilities import export_loops_to_swc_from_skeleton
+    >>> files = export_loops_to_swc_from_skeleton(
+    ...     skeleton=skel_wave,
+    ...     out_dir='loop_swcs',
+    ...     file_prefix='loop',
+    ...     deduplicate=True,
+    ... )
     """
     if skeleton is None:
         raise ValueError('Provide `skeleton`.')
