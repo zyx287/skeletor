@@ -177,6 +177,153 @@ def compute_loop_edge_diff(loop_edges: np.ndarray,
     }
 
 
+def _tree_path_nodes(tree_edges: np.ndarray,
+                     source: int,
+                     target: int) -> list[int]:
+    """Find path nodes between ``source`` and ``target`` in an undirected tree."""
+    if source == target:
+        return [int(source)]
+
+    tree_edges = np.asarray(tree_edges, dtype=int).reshape(-1, 2)
+    adjacency: dict[int, set[int]] = {}
+    for u, v in tree_edges:
+        adjacency.setdefault(int(u), set()).add(int(v))
+        adjacency.setdefault(int(v), set()).add(int(u))
+
+    if source not in adjacency or target not in adjacency:
+        return []
+
+    queue = [int(source)]
+    parent = {int(source): -1}
+    i = 0
+
+    while i < len(queue):
+        node = queue[i]
+        i += 1
+        if node == target:
+            break
+        for nb in adjacency.get(node, ()):
+            if nb in parent:
+                continue
+            parent[nb] = node
+            queue.append(nb)
+
+    if int(target) not in parent:
+        return []
+
+    path = [int(target)]
+    while path[-1] != int(source):
+        path.append(parent[path[-1]])
+    path.reverse()
+    return path
+
+
+def extract_loop_node_sets(loop_edges: np.ndarray,
+                           loop_node_centers: np.ndarray,
+                           tree_skeleton: 'Skeleton | None' = None,
+                           tree_swc: pd.DataFrame | None = None,
+                           tree_edges_loop_index: np.ndarray | None = None,
+                           deduplicate: bool = True) -> dict:
+    """Return node IDs involved in each loop/cycle implied by dropped edges.
+
+    Notes
+    -----
+    SWC is tree-based and cannot encode cycles directly. Loops are therefore
+    inferred as *fundamental cycles*: for each edge dropped when converting the
+    loopy graph to a tree, we recover the unique path between that edge's
+    endpoints in the tree and combine both.
+
+    If ``tree_edges_loop_index`` is not provided and no
+    ``tree_skeleton.loop_tree_edges`` is available, SWC nodes are aligned to
+    loop nodes using nearest-neighbour mapping. In that case, ambiguous matches
+    can merge nearby nodes and affect inferred loops.
+
+    Examples
+    --------
+    A triangle with tree edges ``(0, 1)`` and ``(1, 2)`` has dropped edge
+    ``(0, 2)``. The inferred loop node IDs are ``[0, 1, 2]``.
+    """
+    diff = compute_loop_edge_diff(loop_edges=loop_edges,
+                                  loop_node_centers=loop_node_centers,
+                                  tree_skeleton=tree_skeleton,
+                                  tree_swc=tree_swc,
+                                  tree_edges_loop_index=tree_edges_loop_index)
+
+    tree_edges = diff['tree_edges']
+    dropped_edges = diff['dropped_edges']
+    n_nodes = int(np.asarray(loop_node_centers).shape[0])
+
+    loops = []
+    seen: set[tuple[int, ...]] = set()
+
+    for edge in dropped_edges:
+        u, v = (int(edge[0]), int(edge[1]))
+        path_nodes = _tree_path_nodes(tree_edges, source=u, target=v)
+
+        if path_nodes:
+            node_ids = np.array(sorted(set(path_nodes)), dtype=int)
+            path_edges = np.array(list(zip(path_nodes[:-1], path_nodes[1:])), dtype=int)
+        else:
+            node_ids = np.array(sorted({u, v}), dtype=int)
+            path_edges = np.empty((0, 2), dtype=int)
+
+        key = tuple(node_ids.tolist())
+        if deduplicate and key in seen:
+            continue
+        seen.add(key)
+
+        loops.append({
+            'loop_id': len(loops),
+            'dropped_edge': (u, v),
+            'node_ids': node_ids,
+            'path_edges': path_edges,
+        })
+
+    unique_nodes = (np.unique(np.concatenate([l['node_ids'] for l in loops]))
+                    if loops else np.array([], dtype=int))
+
+    return {
+        'loops': loops,
+        'counts': {
+            'n_loops': int(len(loops)),
+            'n_nodes_total': n_nodes,
+            'n_unique_nodes_in_loops': int(unique_nodes.size),
+        }
+    }
+
+
+def loop_node_sets_from_result(loop_result: dict | None = None,
+                               skeleton: 'Skeleton | None' = None,
+                               deduplicate: bool = True) -> dict:
+    """Convenience wrapper for inferring cycle node sets from wavefront output.
+
+    This mirrors ``visualize_added_loops`` input patterns and returns
+    ``extract_loop_node_sets`` output.
+    """
+    if skeleton is None and loop_result is None:
+        raise ValueError('Provide `skeleton` and/or `loop_result`.')
+
+    if skeleton is not None and hasattr(skeleton, 'loop_edges') and hasattr(skeleton, 'loop_node_centers'):
+        loop_edges = np.asarray(skeleton.loop_edges, dtype=int)
+        loop_node_centers = np.asarray(skeleton.loop_node_centers, dtype=float)
+        loop_tree_edges = getattr(skeleton, 'loop_tree_edges', None)
+        return extract_loop_node_sets(loop_edges=loop_edges,
+                                      loop_node_centers=loop_node_centers,
+                                      tree_skeleton=skeleton,
+                                      tree_edges_loop_index=loop_tree_edges,
+                                      deduplicate=deduplicate)
+
+    if loop_result is None or skeleton is None:
+        raise ValueError('When skeleton has no loop metadata, provide both `loop_result` and `skeleton`.')
+
+    loop_edges = np.asarray(loop_result['edges'], dtype=int)
+    loop_node_centers = np.asarray(loop_result['node_centers'], dtype=float)
+    return extract_loop_node_sets(loop_edges=loop_edges,
+                                  loop_node_centers=loop_node_centers,
+                                  tree_skeleton=skeleton,
+                                  deduplicate=deduplicate)
+
+
 def plot_loop_vs_tree_3d(loop_node_centers: np.ndarray,
                          tree_edges: np.ndarray,
                          dropped_edges: np.ndarray,
