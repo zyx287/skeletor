@@ -45,7 +45,9 @@ other methods, you might want to run `skeletor.post.radii` can help you
 """
 
 from .radiusextraction import radii
-from .postprocessing import clean_up, smooth, despike, remove_bristles
+from .postprocessing import (clean_up, smooth, despike, remove_bristles,
+                             trim_terminal_nodes, collapse_soma_nodes)
 
 __docformat__ = "numpy"
-__all__ = ["radii", "clean_up", "smooth", "despike", "remove_bristles"]
+__all__ = ["radii", "clean_up", "smooth", "despike", "remove_bristles",
+           "trim_terminal_nodes", "collapse_soma_nodes"]

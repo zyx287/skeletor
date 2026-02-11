@@ -20,9 +20,11 @@ import warnings
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 import scipy.spatial
 
 from ..utilities import make_trimesh
+from ..skeletonize.base import Skeleton
 
 
 def clean_up(s, mesh=None, validate=False, inplace=False, **kwargs):
@@ -680,3 +682,241 @@ def despike(s,
     s.swc = this_nodes.reset_index(drop=False, inplace=False)
 
     return s
+
+
+def _to_swc_df(obj):
+    """Convert supported skeleton payloads into a normalized SWC-like table."""
+    if isinstance(obj, Skeleton):
+        swc = obj.swc.copy()
+        meta = {'obj_type': 'skeleton', 'obj': obj}
+    elif isinstance(obj, dict):
+        meta = {'obj_type': 'dict', 'template': obj.copy()}
+        if 'swc' in obj:
+            swc = obj['swc'].copy()
+            meta['dict_layout'] = 'swc'
+        elif {'node_centers', 'edges'} <= set(obj):
+            centers = np.asarray(obj['node_centers'])
+            edges = np.asarray(obj.get('edges', []), dtype=int)
+
+            parent = np.full(len(centers), -1, dtype=int)
+            if edges.size:
+                for c, p in edges:
+                    parent[int(c)] = int(p)
+
+            swc = pd.DataFrame({
+                'node_id': np.arange(len(centers), dtype=int),
+                'parent_id': parent,
+                'x': centers[:, 0],
+                'y': centers[:, 1],
+                'z': centers[:, 2],
+            })
+            if 'node_radii' in obj:
+                swc['radius'] = np.asarray(obj['node_radii'])
+            meta['dict_layout'] = 'node_centers'
+        else:
+            raise TypeError('Unsupported dict layout for postprocessing.')
+    else:
+        raise TypeError(f'Unsupported type for postprocessing: {type(obj)}')
+
+    colmap = {'id': 'node_id', 'parent': 'parent_id', 'type': 'type',
+              'x': 'x', 'y': 'y', 'z': 'z', 'radius': 'radius'}
+    swc = swc.rename(columns={k: v for k, v in colmap.items() if k in swc.columns})
+
+    if 'node_id' not in swc.columns:
+        swc['node_id'] = np.arange(len(swc), dtype=int)
+    if 'parent_id' not in swc.columns:
+        swc['parent_id'] = -1
+    if 'type' not in swc.columns:
+        swc['type'] = 0
+    if 'radius' not in swc.columns:
+        swc['radius'] = np.nan
+
+    needed = ['node_id', 'type', 'x', 'y', 'z', 'radius', 'parent_id']
+    for c in needed:
+        if c not in swc.columns:
+            raise ValueError(f'Missing required skeleton column: {c}')
+
+    swc = swc.copy()
+    swc['node_id'] = swc['node_id'].astype(int)
+    swc['parent_id'] = swc['parent_id'].fillna(-1).astype(int)
+
+    return swc, meta
+
+
+def _topology_reindex_swc(swc):
+    """Reindex SWC so parent IDs are always lower than child IDs."""
+    swc = swc.copy()
+    children = swc.groupby('parent_id')['node_id'].apply(list).to_dict()
+    roots = swc.loc[swc.parent_id < 0, 'node_id'].tolist()
+    visited = set()
+    ordered = []
+
+    def _visit(node_id):
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        ordered.append(node_id)
+        for child in sorted(children.get(node_id, [])):
+            _visit(child)
+
+    for r in sorted(roots):
+        _visit(r)
+
+    for nid in sorted(set(swc.node_id.values) - visited):
+        _visit(nid)
+
+    new_ids = {old: new for new, old in enumerate(ordered)}
+    new_ids[-1] = -1
+
+    swc['node_id'] = swc['node_id'].map(new_ids)
+    swc['parent_id'] = swc['parent_id'].map(lambda x: new_ids.get(x, -1))
+    swc = swc.sort_values('node_id').reset_index(drop=True)
+    return swc
+
+
+def _from_swc_df(df, meta, inplace=False):
+    """Convert normalized SWC table back into the original payload type."""
+    if meta['obj_type'] == 'skeleton':
+        if inplace:
+            meta['obj'].swc = df
+            return meta['obj']
+        out = meta['obj'].copy()
+        out.swc = df
+        return out
+
+    out = meta['template'] if inplace else meta['template'].copy()
+    layout = meta.get('dict_layout', 'swc')
+
+    if layout == 'swc':
+        out['swc'] = df
+        return out
+
+    out['node_centers'] = df[['x', 'y', 'z']].values
+    if 'node_radii' in out or 'radius' in df.columns:
+        out['node_radii'] = df['radius'].values
+    out['edges'] = df.loc[df.parent_id >= 0, ['node_id', 'parent_id']].values.astype(int)
+    return out
+
+
+def trim_terminal_nodes(obj, rounds=1, keep_roots=True, inplace=False, *, reindex=True):
+    """Trim terminal (leaf) nodes one pass per round."""
+    rounds = int(rounds)
+    if rounds < 0:
+        raise ValueError('`rounds` must be >= 0')
+
+    swc, meta = _to_swc_df(obj)
+
+    for _ in range(rounds):
+        parent_ids = set(swc.parent_id.values)
+        leaves = swc.loc[~swc.node_id.isin(parent_ids), 'node_id'].values
+        if keep_roots:
+            roots = set(swc.loc[swc.parent_id < 0, 'node_id'].values)
+            leaves = np.array([n for n in leaves if n not in roots], dtype=int)
+
+        if len(leaves):
+            swc = swc.loc[~swc.node_id.isin(leaves)].copy()
+            if reindex:
+                swc = _topology_reindex_swc(swc)
+
+    return _from_swc_df(swc, meta, inplace=inplace)
+
+
+def _fibonacci_sphere(n_samples):
+    """Generate approximately uniform directions over the unit sphere."""
+    n = int(max(1, n_samples))
+    idx = np.arange(n, dtype=float) + 0.5
+    phi = np.arccos(1 - 2 * idx / n)
+    theta = np.pi * (1 + 5 ** 0.5) * idx
+    xyz = np.column_stack((
+        np.cos(theta) * np.sin(phi),
+        np.sin(theta) * np.sin(phi),
+        np.cos(phi),
+    ))
+    return xyz
+
+
+def collapse_soma_nodes(obj, soma_mesh, *, cell_mesh=None, soma_type=1,
+                        root_id=None, sample_count=200,
+                        allow_no_soma_nodes=True, inplace=False,
+                        reindex=True):
+    """Collapse all nodes inside soma mesh into one soma node."""
+    try:
+        import ncollpyde
+    except ImportError as exc:
+        raise ImportError('collapse_soma_nodes requires `trimesh` and `ncollpyde`.') from exc
+
+    swc, meta = _to_swc_df(obj)
+
+    soma_mesh = make_trimesh(soma_mesh, validate=False)
+    coll = ncollpyde.Volume(soma_mesh.vertices, soma_mesh.faces, validate=False)
+
+    xyz = swc[['x', 'y', 'z']].values
+    inside = coll.contains(xyz)
+    soma_nodes = swc.loc[inside, 'node_id'].values
+    soma_set = set(soma_nodes.tolist())
+
+    if len(soma_nodes) == 0:
+        if allow_no_soma_nodes:
+            return _from_swc_df(swc, meta, inplace=inplace)
+        raise ValueError('No skeleton nodes were found inside soma mesh.')
+
+    if hasattr(soma_mesh, 'centroid') and np.all(np.isfinite(soma_mesh.centroid)):
+        soma_center = np.asarray(soma_mesh.centroid, dtype=float)
+    else:
+        bounds = np.asarray(soma_mesh.bounds, dtype=float)
+        soma_center = bounds.mean(axis=0)
+
+    ext_parents = swc.loc[swc.node_id.isin(soma_nodes) &
+                          (~swc.parent_id.isin(list(soma_set))) &
+                          (swc.parent_id >= 0), 'parent_id'].unique().tolist()
+
+    if root_id is not None:
+        soma_parent = int(root_id)
+    elif ext_parents:
+        ext_xyz = swc.set_index('node_id').loc[ext_parents, ['x', 'y', 'z']].values
+        soma_parent = int(ext_parents[int(np.argmin(np.linalg.norm(ext_xyz - soma_center, axis=1)))])
+    else:
+        soma_parent = -1
+
+    collapsed_xyz = swc.loc[swc.node_id.isin(soma_nodes), ['x', 'y', 'z']].values
+    collapsed_dist = np.linalg.norm(collapsed_xyz - soma_center, axis=1)
+    radius_est = float(np.mean(collapsed_dist)) if len(collapsed_dist) else 0.0
+
+    if cell_mesh is not None:
+        cell_mesh = make_trimesh(cell_mesh, validate=False)
+        rays = _fibonacci_sphere(sample_count)
+        loc, ix_ray, _ = cell_mesh.ray.intersects_location(
+            ray_origins=np.repeat(soma_center[None, :], len(rays), axis=0),
+            ray_directions=rays,
+            multiple_hits=False,
+        )
+        if len(ix_ray):
+            hit_dist = np.linalg.norm(loc - soma_center, axis=1)
+            ray_radius = float(np.mean(hit_dist))
+            if np.isfinite(ray_radius) and ray_radius > 0:
+                radius_est = float(np.mean([radius_est, ray_radius])) if radius_est > 0 else ray_radius
+
+    keep = swc.loc[~swc.node_id.isin(soma_nodes)].copy()
+    if len(keep):
+        rewire_mask = keep.parent_id.isin(soma_nodes)
+        keep.loc[rewire_mask, 'parent_id'] = -999999
+
+    new_id = int(max(swc.node_id.max(), -1) + 1)
+    soma_row = {c: np.nan for c in swc.columns}
+    soma_row.update({
+        'node_id': new_id,
+        'parent_id': soma_parent,
+        'type': soma_type,
+        'x': float(soma_center[0]),
+        'y': float(soma_center[1]),
+        'z': float(soma_center[2]),
+        'radius': float(radius_est),
+    })
+
+    swc = pd.concat([keep, pd.DataFrame([soma_row])], ignore_index=True)
+    swc.loc[swc.parent_id == -999999, 'parent_id'] = new_id
+
+    if reindex:
+        swc = _topology_reindex_swc(swc)
+
+    return _from_swc_df(swc, meta, inplace=inplace)
