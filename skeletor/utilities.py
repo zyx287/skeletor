@@ -18,6 +18,7 @@ import trimesh as tm
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -322,6 +323,268 @@ def loop_node_sets_from_result(loop_result: dict | None = None,
                                   loop_node_centers=loop_node_centers,
                                   tree_skeleton=skeleton,
                                   deduplicate=deduplicate)
+
+
+def derive_loop_to_swc_node_map(skeleton: 'Skeleton') -> dict[int, int]:
+    """Derive loop-node ID -> SWC node ID mapping via mesh correspondences.
+
+    Notes
+    -----
+    Loop-node IDs live in loop-graph index space (``loop_node_centers`` /
+    ``loop_edges``) and are not guaranteed to match SWC ``node_id`` values,
+    because SWC can be reindexed during tree construction.
+
+    Mapping is derived explicitly using:
+      * ``loop_vertex_to_node_map``: mesh vertex -> loop-node ID
+      * ``mesh_map``: mesh vertex -> SWC node ID
+
+    If multiple mesh vertices vote for different SWC IDs for the same loop node,
+    the most frequent SWC ID is chosen (ties broken by smaller ID).
+    """
+    if not hasattr(skeleton, 'loop_vertex_to_node_map'):
+        raise ValueError('Skeleton is missing `loop_vertex_to_node_map`.')
+    if getattr(skeleton, 'mesh_map', None) is None:
+        raise ValueError('Skeleton is missing `mesh_map`.')
+
+    loop_vertex_to_node_map = np.asarray(skeleton.loop_vertex_to_node_map, dtype=int).reshape(-1)
+    mesh_map = np.asarray(skeleton.mesh_map, dtype=int).reshape(-1)
+
+    if loop_vertex_to_node_map.shape[0] != mesh_map.shape[0]:
+        raise ValueError('`loop_vertex_to_node_map` and `mesh_map` must have matching lengths.')
+
+    mapping: dict[int, int] = {}
+    for loop_id in np.unique(loop_vertex_to_node_map):
+        swc_ids = mesh_map[loop_vertex_to_node_map == loop_id]
+        if swc_ids.size == 0:
+            continue
+        values, counts = np.unique(swc_ids, return_counts=True)
+        best = values[np.flatnonzero(counts == counts.max())].min()
+        mapping[int(loop_id)] = int(best)
+
+    return mapping
+
+
+def _orient_edges_to_parent_map(edges_local: np.ndarray,
+                                n_nodes: int,
+                                root_local: int) -> np.ndarray:
+    """Build deterministic SWC parent array from local undirected edges."""
+    parents = np.full(n_nodes, -1, dtype=int)
+    if n_nodes == 0:
+        return parents
+
+    adjacency: dict[int, set[int]] = {i: set() for i in range(n_nodes)}
+    for edge in np.asarray(edges_local, dtype=int).reshape(-1, 2):
+        u, v = int(edge[0]), int(edge[1])
+        if u < 0 or v < 0 or u >= n_nodes or v >= n_nodes or u == v:
+            continue
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+
+    seen = {int(root_local)}
+    queue = [int(root_local)]
+    i = 0
+
+    while i < len(queue):
+        node = queue[i]
+        i += 1
+        for nb in sorted(adjacency.get(node, ())):
+            if nb in seen:
+                continue
+            seen.add(nb)
+            parents[nb] = node + 1
+            queue.append(nb)
+
+    for node in range(n_nodes):
+        if node in seen:
+            continue
+        seen.add(node)
+        queue = [node]
+        j = 0
+        while j < len(queue):
+            cur = queue[j]
+            j += 1
+            for nb in sorted(adjacency.get(cur, ())):
+                if nb in seen:
+                    continue
+                seen.add(nb)
+                parents[nb] = cur + 1
+                queue.append(nb)
+
+    return parents
+
+
+def export_loops_to_swc(loop_info: dict,
+                        loop_node_centers: np.ndarray,
+                        loop_node_radii: np.ndarray | None = None,
+                        out_dir: str = 'loop_swcs',
+                        file_prefix: str = 'loop',
+                        break_on_dropped_edge: bool = True,
+                        dropped_edge_name_in_header: bool = True) -> list[str]:
+    """Export one SWC per inferred loop from ``loop_info['loops']``.
+
+    Parameters
+    ----------
+    loop_info : dict
+        Output from :func:`extract_loop_node_sets` or
+        :func:`loop_node_sets_from_result`.
+    loop_node_centers : (N, 3) array
+        Loop-node coordinates in loop-graph index space.
+    loop_node_radii : (N,) array, optional
+        Optional loop-node radii in loop-graph index space.
+
+    Notes
+    -----
+    ``loop_info['loops'][i]['node_ids']`` are interpreted as loop-graph IDs,
+    i.e. indices into ``loop_node_centers`` / ``loop_node_radii``.
+    They are not assumed to match SWC ``node_id`` values.
+    """
+    loops = list(loop_info.get('loops', []))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    centers = np.asarray(loop_node_centers, dtype=float)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError('`loop_node_centers` must be shape (N, 3).')
+
+    radii = None
+    if loop_node_radii is not None:
+        radii = np.asarray(loop_node_radii, dtype=float).reshape(-1)
+        if radii.shape[0] != centers.shape[0]:
+            raise ValueError('`loop_node_radii` length must match loop nodes.')
+
+    if not loops:
+        return []
+
+    written: list[str] = []
+    for loop in loops:
+        loop_id = int(loop['loop_id'])
+        node_ids = np.asarray(loop.get('node_ids', []), dtype=int).reshape(-1)
+        path_edges = np.asarray(loop.get('path_edges', []), dtype=int).reshape(-1, 2)
+        dropped_edge = tuple(np.asarray(loop.get('dropped_edge', (-1, -1)), dtype=int).tolist())
+
+        if node_ids.size == 0:
+            continue
+        if np.any(node_ids < 0) or np.any(node_ids >= centers.shape[0]):
+            raise ValueError(
+                'Loop `node_ids` are out of bounds for `loop_node_centers`; '
+                'use loop-graph IDs, not SWC node IDs.'
+            )
+
+        node_ids = np.array(sorted(set(node_ids.tolist())), dtype=int)
+        global_to_local = {nid: i for i, nid in enumerate(node_ids.tolist())}
+
+        local_edges = []
+        for u, v in path_edges:
+            u_i = global_to_local.get(int(u))
+            v_i = global_to_local.get(int(v))
+            if u_i is None or v_i is None:
+                continue
+            local_edges.append((u_i, v_i))
+
+        if not break_on_dropped_edge and len(dropped_edge) == 2:
+            du_i = global_to_local.get(int(dropped_edge[0]))
+            dv_i = global_to_local.get(int(dropped_edge[1]))
+            if du_i is not None and dv_i is not None and du_i != dv_i:
+                local_edges.append((du_i, dv_i))
+
+        if dropped_edge and int(dropped_edge[0]) in global_to_local:
+            root_local = global_to_local[int(dropped_edge[0])]
+        else:
+            root_local = 0
+
+        parents = _orient_edges_to_parent_map(np.asarray(local_edges, dtype=int),
+                                              n_nodes=node_ids.size,
+                                              root_local=root_local)
+
+        local_centers = centers[node_ids]
+        local_radii = radii[node_ids] if radii is not None else np.zeros(node_ids.size, dtype=float)
+
+        file_path = out_path / f'{file_prefix}_{loop_id:03d}.swc'
+        with file_path.open('w') as f:
+            f.write('# SWC format file\n')
+            f.write('# Exported from loop node sets (loop-graph ID space)\n')
+            if dropped_edge_name_in_header and len(dropped_edge) == 2:
+                f.write(f'# dropped_edge: {int(dropped_edge[0])} {int(dropped_edge[1])}\n')
+            for i in range(node_ids.size):
+                x, y, z = local_centers[i]
+                row = [i + 1, 0, x, y, z, local_radii[i], int(parents[i])]
+                f.write(' '.join(map(str, row)) + '\n')
+
+        written.append(str(file_path))
+
+    return written
+
+
+def export_loops_to_swc_from_skeleton(skeleton: 'Skeleton',
+                                      loop_result: dict | None = None,
+                                      out_dir: str = 'loop_swcs',
+                                      file_prefix: str = 'loop',
+                                      deduplicate: bool = True,
+                                      break_on_dropped_edge: bool = True) -> list[str]:
+    """Infer loop node sets and export one SWC per loop.
+
+    Loop node IDs from loop utilities are interpreted in loop-graph index
+    space and exported from ``skeleton.loop_node_centers`` / radii where
+    available.
+
+    Examples
+    --------
+    Export inferred loops after ``by_wavefront_keep_loops(..., return_swc=True)``:
+
+    >>> import skeletor as sk
+    >>> from skeletor.utilities import (
+    ...     loop_node_sets_from_result,
+    ...     export_loops_to_swc,
+    ... )
+    >>> skel_wave = sk.skeletonize.by_wavefront_keep_loops(
+    ...     fixed,
+    ...     waves=1,
+    ...     step_size=step_size,
+    ...     soma_mesh=soma_mesh,
+    ...     return_swc=True,
+    ...     progress=False,
+    ... )
+    >>> loop_info = loop_node_sets_from_result(skeleton=skel_wave, deduplicate=True)
+    >>> files = export_loops_to_swc(
+    ...     loop_info=loop_info,
+    ...     loop_node_centers=skel_wave.loop_node_centers,
+    ...     loop_node_radii=getattr(skel_wave, 'loop_node_radii', None),
+    ...     out_dir='loop_swcs',
+    ...     file_prefix='loop',
+    ... )
+
+    Or use the convenience wrapper:
+
+    >>> from skeletor.utilities import export_loops_to_swc_from_skeleton
+    >>> files = export_loops_to_swc_from_skeleton(
+    ...     skeleton=skel_wave,
+    ...     out_dir='loop_swcs',
+    ...     file_prefix='loop',
+    ...     deduplicate=True,
+    ... )
+    """
+    if skeleton is None:
+        raise ValueError('Provide `skeleton`.')
+
+    loop_info = loop_node_sets_from_result(loop_result=loop_result,
+                                           skeleton=skeleton,
+                                           deduplicate=deduplicate)
+
+    if hasattr(skeleton, 'loop_node_centers'):
+        loop_node_centers = np.asarray(skeleton.loop_node_centers, dtype=float)
+        loop_node_radii = getattr(skeleton, 'loop_node_radii', None)
+    else:
+        if loop_result is None:
+            raise ValueError('When skeleton has no loop metadata, provide `loop_result`.')
+        loop_node_centers = np.asarray(loop_result['node_centers'], dtype=float)
+        loop_node_radii = loop_result.get('node_radii', None)
+
+    return export_loops_to_swc(loop_info=loop_info,
+                               loop_node_centers=loop_node_centers,
+                               loop_node_radii=loop_node_radii,
+                               out_dir=out_dir,
+                               file_prefix=file_prefix,
+                               break_on_dropped_edge=break_on_dropped_edge)
 
 
 def plot_loop_vs_tree_3d(loop_node_centers: np.ndarray,
