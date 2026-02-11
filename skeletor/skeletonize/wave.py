@@ -24,6 +24,7 @@ from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
 from ..utilities import make_trimesh
+from ..post.postprocessing import trim_terminal_nodes, collapse_soma_nodes
 from .base import Skeleton
 from .utils import make_swc, reindex_swc, edges_to_graph
 
@@ -184,7 +185,13 @@ def by_wavefront_keep_loops(mesh,
                             return_swc: bool = False,
                             tree_method: str = 'mst',
                             tree_params: dict | None = None,
-                            attach_tree_edges: bool = True):
+                            attach_tree_edges: bool = True,
+                            post_trim_rounds: int = 0,
+                            post_collapse_soma: bool = False,
+                            post_soma_mesh=None,
+                            post_cell_mesh=None,
+                            post_keep_roots: bool = True,
+                            post_reindex: bool = True):
     """Skeletonize a mesh by wavefront contraction with optional SWC export.
 
     Always computes the loop-preserving contracted graph first. If
@@ -235,7 +242,7 @@ def by_wavefront_keep_loops(mesh,
     loop_edges = np.array(G.get_edgelist(), dtype=int)
 
     if not return_swc:
-        return {
+        out = {
             'node_centers': node_centers,
             'node_radii': node_radii,
             'edges': loop_edges,
@@ -243,6 +250,27 @@ def by_wavefront_keep_loops(mesh,
             'mesh': mesh,
             'mesh_map': vertex_to_node_map,
         }
+        if post_trim_rounds > 0:
+            out = trim_terminal_nodes(out,
+                                      rounds=1,
+                                      keep_roots=post_keep_roots,
+                                      inplace=False,
+                                      reindex=post_reindex)
+        if post_collapse_soma:
+            if post_soma_mesh is None:
+                raise ValueError('`post_soma_mesh` is required when `post_collapse_soma=True`.')
+            out = collapse_soma_nodes(out,
+                                      soma_mesh=post_soma_mesh,
+                                      cell_mesh=post_cell_mesh,
+                                      inplace=False,
+                                      reindex=post_reindex)
+        if post_trim_rounds > 1:
+            out = trim_terminal_nodes(out,
+                                      rounds=1,
+                                      keep_roots=post_keep_roots,
+                                      inplace=False,
+                                      reindex=post_reindex)
+        return out
 
     tree_edges = _wavefront_tree_edges(
         G=G,
@@ -273,7 +301,36 @@ def by_wavefront_keep_loops(mesh,
     if attach_tree_edges:
         skeleton.loop_tree_edges = np.array(tree_edges, dtype=int)
 
-    return skeleton
+    out = skeleton
+    if post_trim_rounds > 0:
+        out = trim_terminal_nodes(out,
+                                  rounds=1,
+                                  keep_roots=post_keep_roots,
+                                  inplace=False,
+                                  reindex=post_reindex)
+    if post_collapse_soma:
+        if post_soma_mesh is None:
+            raise ValueError('`post_soma_mesh` is required when `post_collapse_soma=True`.')
+        out = collapse_soma_nodes(out,
+                                  soma_mesh=post_soma_mesh,
+                                  cell_mesh=post_cell_mesh,
+                                  inplace=False,
+                                  reindex=post_reindex)
+    if post_trim_rounds > 1:
+        out = trim_terminal_nodes(out,
+                                  rounds=1,
+                                  keep_roots=post_keep_roots,
+                                  inplace=False,
+                                  reindex=post_reindex)
+
+    if isinstance(out, Skeleton):
+        for attr in ('loop_node_centers', 'loop_node_radii', 'loop_edges',
+                     'loop_igraph', 'loop_vertex_to_node_map'):
+            setattr(out, attr, getattr(skeleton, attr))
+        if attach_tree_edges and hasattr(skeleton, 'loop_tree_edges'):
+            out.loop_tree_edges = skeleton.loop_tree_edges
+
+    return out
 
 
 def _wavefront_contracted_graph(mesh, waves, origins, step_size, rad_agg_func,
