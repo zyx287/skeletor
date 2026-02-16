@@ -2,6 +2,33 @@ import skeletor as sk
 import trimesh as tm
 import networkx as nx
 import numpy as np
+import ncollpyde
+
+
+def _count_crossing_edges(skeleton, mesh, eps=1e-6):
+    """Count skeleton edges that cross the mesh boundary."""
+    coll = ncollpyde.Volume(mesh.vertices, mesh.faces, validate=False)
+    swc = skeleton.swc
+
+    not_root = swc.parent_id >= 0
+    if not np.any(not_root):
+        return 0
+
+    sources = swc.loc[not_root, ['x', 'y', 'z']].values
+    parent_ids = swc.loc[not_root, 'parent_id'].values
+    targets = swc.set_index('node_id').loc[parent_ids, ['x', 'y', 'z']].values
+
+    ix, loc, _ = coll.intersections(sources, targets)
+    if len(ix) == 0:
+        return 0
+
+    d_src = np.linalg.norm(loc - sources[ix], axis=1)
+    d_tgt = np.linalg.norm(loc - targets[ix], axis=1)
+    crossing = (d_src > eps) & (d_tgt > eps)
+    if not crossing.any():
+        return 0
+
+    return int(np.unique(ix[crossing]).size)
 
 
 class TestPreprocessing:
@@ -21,6 +48,15 @@ class TestPreprocessing:
 
 
 class TestSkeletonization:
+    def test_wavefront_default_backward_compatibility(self):
+        s = sk.skeletonize.by_wavefront(sk.example_mesh(), waves=1)
+        assert isinstance(s.vertices, np.ndarray)
+        assert isinstance(s.edges, np.ndarray)
+        assert isinstance(s.mesh_map, np.ndarray)
+        assert s.vertices.shape[1] == 3
+        assert s.edges.shape[1] == 2
+        assert len(s.mesh_map) == len(s.mesh.vertices)
+
     def test_wave_skeletonization(self):
         one_wave = sk.skeletonize.by_wavefront(sk.example_mesh(), waves=1)
         two_wave = sk.skeletonize.by_wavefront(sk.example_mesh(), waves=2)
@@ -30,6 +66,49 @@ class TestSkeletonization:
         for s in [one_wave, two_wave, stepsize]:
             assert len(s.mesh_map) == len(s.mesh.vertices)
             assert all(np.isin(s.mesh_map, s.swc.node_id.values))
+
+    def test_wavefront_inside_nodes_mode(self):
+        mesh = sk.pre.fix_mesh(sk.example_mesh(), remove_disconnected=5, inplace=False)
+        s = sk.skeletonize.by_wavefront(mesh,
+                                        waves=1,
+                                        inside_mode='nodes',
+                                        center_mode='inside_mean',
+                                        progress=False)
+        coll = ncollpyde.Volume(mesh.vertices, mesh.faces, validate=False)
+        assert coll.contains(s.vertices).all()
+
+    def test_wavefront_inside_nodes_edges_mode(self):
+        mesh = sk.pre.fix_mesh(sk.example_mesh(), remove_disconnected=5, inplace=False)
+        s = sk.skeletonize.by_wavefront(mesh,
+                                        waves=1,
+                                        inside_mode='nodes_edges',
+                                        center_mode='inside_mean',
+                                        progress=False)
+        coll = ncollpyde.Volume(mesh.vertices, mesh.faces, validate=False)
+        assert coll.contains(s.vertices).all()
+        assert _count_crossing_edges(s, mesh) == 0
+
+    def test_wavefront_strict_can_add_nodes(self):
+        mesh = sk.pre.fix_mesh(sk.example_mesh(), remove_disconnected=5, inplace=False)
+        default = sk.skeletonize.by_wavefront(mesh, waves=1, progress=False)
+        strict = sk.skeletonize.by_wavefront(mesh,
+                                             waves=1,
+                                             inside_mode='nodes_edges',
+                                             center_mode='inside_mean',
+                                             progress=False)
+        assert strict.swc.shape[0] >= default.swc.shape[0]
+
+    def test_wavefront_max_edge_fix_iter_zero_does_not_crash(self):
+        mesh = sk.pre.fix_mesh(sk.example_mesh(), remove_disconnected=5, inplace=False)
+        s = sk.skeletonize.by_wavefront(mesh,
+                                        waves=1,
+                                        inside_mode='nodes_edges',
+                                        center_mode='inside_mean',
+                                        max_edge_fix_iter=0,
+                                        progress=False)
+        assert isinstance(s.vertices, np.ndarray)
+        assert isinstance(s.edges, np.ndarray)
+        assert isinstance(s.mesh_map, np.ndarray)
 
     def test_vertex_cluster(self):
         s = sk.skeletonize.by_vertex_clusters(sk.example_mesh(),

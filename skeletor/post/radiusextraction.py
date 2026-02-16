@@ -31,9 +31,11 @@ def radii(s, mesh=None, method='knn', aggregate='mean', validate=False, **kwargs
     Important
     ---------
     This function really only produces useful radii if the skeleton is centered
-    inside the mesh. `by_wavefront` does that by default whereas all other
-    skeletonization methods don't. Your best bet to get centered skeletons is
-    to contract the mesh first (`sk.pre.contract`).
+    inside the mesh. `by_wavefront` often does that by default and can be made
+    stricter with ``inside_mode='nodes_edges'`` and
+    ``center_mode='inside_mean'``. Other skeletonization methods generally need
+    additional processing. Your best bet to get centered skeletons is to
+    contract the mesh first (`sk.pre.contract`).
 
     Parameters
     ----------
