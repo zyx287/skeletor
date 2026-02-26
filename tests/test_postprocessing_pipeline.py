@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import trimesh
 
 from skeletor.post.postprocessing import trim_terminal_nodes, collapse_soma_nodes
@@ -50,41 +51,51 @@ def test_collapse_soma_nodes_rewires_children():
     assert int(child_row.parent_id.iloc[0]) == soma_id
 
 
-def test_by_wavefront_keep_loops_defaults_do_not_run_post(monkeypatch):
+def test_by_wavefront_keep_loops_returns_edges_vertices_tuple():
     mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=8)
+    edges, vertices = wave.by_wavefront_keep_loops(mesh, waves=1, progress=False)
 
-    monkeypatch.setattr(wave, 'trim_terminal_nodes',
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('trim should not run')))
-    monkeypatch.setattr(wave, 'collapse_soma_nodes',
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('collapse should not run')))
-
-    out = wave.by_wavefront_keep_loops(mesh, waves=1, progress=False, return_swc=False)
-    assert {'node_centers', 'node_radii', 'edges', 'mesh_map'} <= set(out)
+    assert isinstance(edges, np.ndarray)
+    assert isinstance(vertices, np.ndarray)
+    assert edges.ndim == 2 and edges.shape[1] == 2
+    assert vertices.ndim == 2 and vertices.shape[1] == 3
 
 
-def test_by_wavefront_keep_loops_post_sequence(monkeypatch):
+def test_by_wavefront_keep_loops_keeps_cycle_edges(monkeypatch):
+    edges_cycle = np.array([[0, 1], [1, 2], [2, 0]], dtype=int)
+    node_centers = np.array([[0.0, 0.0, 0.0],
+                             [1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0]])
+    node_radii = np.array([1.0, 1.0, 1.0], dtype=float)
+    mesh_map = np.array([0, 1, 2], dtype=int)
+    G_cycle = wave.ig.Graph(edges=edges_cycle, directed=False)
+    mesh_stub = type('MeshStub', (), {
+        'vertices': node_centers,
+        'faces': np.array([[0, 1, 2]], dtype=int),
+    })()
+
+    monkeypatch.setattr(wave, '_wavefront_contracted_graph',
+                        lambda **kwargs: (node_centers, node_radii, G_cycle.copy(), mesh_map))
+    monkeypatch.setattr(wave, 'make_trimesh', lambda mesh, validate=False: mesh)
+
+    edges, vertices = wave.by_wavefront_keep_loops(mesh_stub, waves=1, progress=False)
+    expected = {tuple(sorted(e)) for e in edges_cycle.tolist()}
+    observed = {tuple(sorted(e)) for e in edges.tolist()}
+
+    assert observed == expected
+    assert np.allclose(vertices, node_centers)
+
+
+def test_by_wavefront_keep_loops_removed_kwargs_raise_typeerror():
     mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=8)
-    calls = []
+    with pytest.raises(TypeError):
+        wave.by_wavefront_keep_loops(mesh, waves=1, progress=False, return_swc=False)
 
-    def _trim(obj, rounds=1, **kwargs):
-        calls.append(('trim', rounds))
-        return obj
+    with pytest.raises(TypeError):
+        wave.by_wavefront_keep_loops(mesh, waves=1, progress=False, post_trim_rounds=1)
 
-    def _collapse(obj, soma_mesh=None, **kwargs):
-        calls.append(('collapse', soma_mesh))
-        return obj
 
-    monkeypatch.setattr(wave, 'trim_terminal_nodes', _trim)
-    monkeypatch.setattr(wave, 'collapse_soma_nodes', _collapse)
-
-    wave.by_wavefront_keep_loops(mesh,
-                                 waves=1,
-                                 progress=False,
-                                 return_swc=False,
-                                 post_trim_rounds=2,
-                                 post_collapse_soma=True,
-                                 post_soma_mesh=object())
-
-    assert calls[0][0] == 'trim'
-    assert calls[1][0] == 'collapse'
-    assert calls[2][0] == 'trim'
+def test_by_wavefront_keep_loops_invalid_radius_agg_raises():
+    mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=8)
+    with pytest.raises(AssertionError, match=r'Unknown `radius_agg`'):
+        wave.by_wavefront_keep_loops(mesh, waves=1, progress=False, radius_agg='nope')
